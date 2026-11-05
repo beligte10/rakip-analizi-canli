@@ -1107,7 +1107,12 @@
   @media (min-width: 901px) and (any-pointer: fine), (min-width: 1025px) {
     body.tek-ekran { padding-bottom: 0; }
     body.tek-ekran:not(.pdf-slide):not(.pdf-capture) .main-panel { min-height: 0; }
+    /* Asistan düğmesi: Tek ekran AÇIKken USD seçicisinin hemen yanında (konumu ChatPanel ölçer: left/top satır içi), KAPALIyken sağ altta yüzer */
+    body.tek-ekran .chat-fab.chat-fab-bar {
+      right: auto; bottom: auto; height: 26px; padding: 0 9px; font-size: 12px; gap: 5px; box-shadow: none; border-radius: 8px; z-index: 40;   /* 2026-11-05: küçültüldü (30→26 px) */
+    }
     /* Ölçü satırı: ölçü alanı ve ⇄ düğmesi daralır; sağda Asistan için yer ayrılır (html body öneki: ≤1200 px kuralını geçmek için) */
+    html body.tek-ekran .control-bar { padding-right: 104px; }
     body.tek-ekran .control-bar > .control-field-measure { flex: 1 1 0; min-width: 0; }
     body.tek-ekran .control-field-measure .control-field-row { min-width: 0; }
     body.tek-ekran .control-field-measure .control-select.measure { flex: 1 1 0; min-width: 0; }
@@ -2594,13 +2599,6 @@
     box-shadow: 0 6px 20px rgba(20, 60, 20, 0.28);
   }
   .chat-fab:hover { background: var(--kt-green-dark); }
-  /* Asistan düğmesi HER ZAMAN sağ üstte (2026-11-05): üst çubuk öbeğinin solunda (konumu ChatPanel ölçer: left/top satır içi);
-     ölçülemezse sabit sağ-üst köşe (hamburgerin solu). Küçük "hap" biçimi. */
-  .chat-fab.chat-fab-ust {
-    top: 10px; right: 78px; bottom: auto; left: auto; height: 30px; padding: 0 12px; font-size: 12.5px; gap: 6px;
-    box-shadow: none; border-radius: 9px; z-index: 900;
-  }
-  .chat-fab.chat-fab-ust.chat-fab-bar { right: auto; z-index: 40; }
   .chat-panel {
     position: fixed; right: 20px; bottom: 20px; z-index: 950;
     width: 420px; max-width: calc(100vw - 32px);
@@ -2714,7 +2712,7 @@
   .chat-send { height: 38px; min-width: 64px; }
   .chat-disclaimer { font-size: 10.5px; color: #64748b; text-align: center; padding: 0 10px 8px; }
   @media (max-width: 600px) {
-    .chat-fab.chat-fab-ust { right: 70px; top: 8px; padding: 0 10px; }
+    .chat-fab { right: 16px; bottom: 16px; padding: 12px 16px; }
     .chat-panel { right: 0; bottom: 0; width: 100vw; max-width: 100vw; height: 100dvh; border-radius: 0; border: none; }
   }
 
@@ -3499,7 +3497,8 @@
     .tree-checkbox { width: 28px; height: 28px; flex: none; accent-color: var(--kt-green-dark); }
   }
   @media (max-width: 600px) {
-    .chat-fab.chat-fab-ust { width: 34px; height: 34px; padding: 0; justify-content: center; font-size: 17px; border-radius: 9px; }
+    .chat-fab { width: 56px; height: 56px; padding: 0; justify-content: center; font-size: 22px;
+      box-shadow: 0 10px 28px rgba(20,60,20,0.32); }
     .chat-fab span { display: none; }
   }
   /* Yükleme / hata ekranı ve genel klavye odağı (2026-10-22) */
@@ -11619,9 +11618,8 @@
         });
     }
 
-    // Asistan düğmesi HER ZAMAN sağ üstte (2026-11-05): üst çubuktaki STRATEJİ + hamburger öbeğinin (.sag-kume) hemen solunda,
-    // başlık dikeyinde ortalı. Öbek görünür değilse / sığmıyorsa CSS'teki sabit sağ-üst konuma (.chat-fab-ust) düşer.
-    // ResizeObserver + resize/scroll ile güncellenir.
+    // Asistan düğmesi konumu: Tek ekran AÇIK ve masaüstü (≥901 px, fare) iken USD seçicisinin (.baz-sec; yoksa ölçü kutusunun) hemen sağında;
+    // aksi hâlde varsayılan sağ alt. ResizeObserver + resize/scroll ile güncellenir.
     var fabPosSt = useState(null);
     var fabRef = useRef(null);
     useEffect(function() {
@@ -11629,12 +11627,14 @@
       function olc() {
         var konum = null;
         try {
-          var sk = document.querySelector('.sag-kume');
-          if (sk && fabRef.current) {
-            var r = sk.getBoundingClientRect(), fw = fabRef.current.offsetWidth || 110, fh = fabRef.current.offsetHeight || 30;
-            var left = Math.round(r.left - fw - 12), top = Math.round(r.top + (r.height - fh) / 2);
-            var orta = document.querySelector('.dsb-orta'), solSinir = orta ? orta.getBoundingClientRect().right + 6 : 0;
-            if (r.width > 0 && r.height > 0 && top >= 0 && left > solSinir) konum = { left: left, top: top };
+          var bar = document.querySelector('.control-bar');
+          if (tekEkranUygunMu() && bar && fabRef.current) {
+            var cap = bar.querySelector('.baz-sec:not(.baz-sec-mobil)') || bar.querySelector('.control-field-measure') || bar.querySelector('select.measure');
+            if (cap) {
+              var r = cap.getBoundingClientRect(), fw = fabRef.current.offsetWidth || 110, fh = fabRef.current.offsetHeight || 30;
+              var left = Math.round(r.right + 8), top = Math.round(r.top + (r.height - fh) / 2);
+              if (r.width > 0 && r.height > 0 && left + fw <= window.innerWidth - 4 && top >= 0) konum = { left: left, top: top };
+            }
           }
         } catch (e) { konum = null; }
         fabPosSt[1](function(o) {
@@ -11647,8 +11647,8 @@
       var ro = null;
       if (typeof ResizeObserver !== 'undefined') {
         ro = new ResizeObserver(olc);
-        var b0 = document.querySelector('.date-selector-bar') || document.querySelector('.topbar');
-        if (b0) { ro.observe(b0); Array.prototype.forEach.call(b0.querySelectorAll('.sag-kume, .dsb-orta'), function(el){ ro.observe(el); }); }
+        var b0 = document.querySelector('.control-bar');
+        if (b0) { ro.observe(b0); Array.prototype.forEach.call(b0.querySelectorAll('.control-field, .baz-sec'), function(el){ ro.observe(el); }); }
         ro.observe(document.body);
       }
       window.addEventListener('resize', olc);
@@ -11664,7 +11664,7 @@
 
     if (!openState[0]) {
       var fp = fabPosSt[0];
-      return hc('button', { className: 'chat-fab chat-fab-ust' + (fp ? ' chat-fab-bar' : ''), ref: fabRef, style: fp ? { left: fp.left + 'px', top: fp.top + 'px' } : undefined,
+      return hc('button', { className: 'chat-fab' + (fp ? ' chat-fab-bar' : ''), ref: fabRef, style: fp ? { left: fp.left + 'px', top: fp.top + 'px' } : undefined,
         onClick: function(){ openState[1](true); },
         title: 'Yapay zeka asistanı', 'aria-label': 'Asistanı aç' }, '💬', hc('span', null, 'Asistan'));
     }
