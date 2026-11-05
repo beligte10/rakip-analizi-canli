@@ -1,0 +1,146 @@
+[
+  {
+    "version": "v2.4",
+    "date": "2026-10-25",
+    "title": "Kuveyt Türk sıra rozeti, çeyrek butonları ve PDF iyileştirmeleri",
+    "items": [
+      "Sıralama listesinde Kuveyt Türk'ün sıra rakamı büyük ve belirgin bir puntoyla gösteriliyor.",
+      "Kompozisyon'da Kuveyt Türk'ün her kalemdeki bankalar arası sırası gösteriliyor.",
+      "Çeyrek seçimi açılır liste yerine yıl kutusunun yanında yan yana butonlar (Mart · Haziran · Eylül · Aralık).",
+      "PDF çıktıları daha keskin; başlıklar, Banka Grupları değerleri ve Rakip Bankalar CAGR grafik etiketleri düzeltildi, Trend grafiği sayfayı dolduruyor.",
+      "Trend çizgileri bazı tarayıcılarda yalnız nokta olarak görünüyordu, düzeltildi."
+    ]
+  },
+  {
+    "version": "v2.3",
+    "date": "2026-09-29",
+    "title": "Asistan, Odak banka, PDF sunumu ve tek ekran görünümü",
+    "items": [
+      "Kart ve ölçü başlıkları daha belirgin: büyük punto, yeşil vurgu çizgisi.",
+      "Anlık Görünüm için yeni \"Tek ekran\" tasarımı (menü → Görünüm): kaydırma olmadan 27 bankanın tamamı tek ekranda; sıra numaralı sıralama tablosu, yatay çubuklu YtD listesi, pastil biçimli değişim rozetleri ve KPI kutucukları; yazılar ekrana göre büyür, kart içinde yana kaydırma yok.",
+      "YtD Büyüme kartında ortalama seçici: basit ortalama, ağırlıklı ortalama (bankaların büyüklüğüne göre) ya da ikisi birlikte gösterilebiliyor.",
+      "Kompozisyon sekmesine \"Mevduat Kompozisyonu\" eklendi: Döviz Dağılımı'nda mevduat TP ve YP olarak, her biri de vadeli / vadesiz mevduat olarak ayrışıyor.",
+      "Yeni Asistan (sağ alttaki 💬): sorularınızı yanıtlar, ölçü ve banka değerlerini getirir, TCMB verilerini (kur, faiz, enflasyon) kullanır.",
+      "🎯 Odak: kendi odak bankanızı seçin; yapay zeka seçtiğiniz bankaya göre rakip bankaları gerekçeleriyle önerir.",
+      "PDF: ekrandaki görünümü 16:9 sunum slaytları olarak indirin; ölçü, dönem ve banka sınıfı seçilebilir.",
+      "Trend ve Kompozisyon yenilendi; grafikleri ⬇ PNG olarak indirebilirsiniz.",
+      "Ölçü Oluştur'a formül sekmesi eklendi; ⇄ ile (ya da Q tuşuyla) önceki ölçüye tek tıkla dönülüyor.",
+      "Değeri olmayan bankalar \"Tanımsız\" ya da \"Veri yok\" etiketiyle, nedeni açıklanarak gösteriliyor.",
+      "Reel TL ve USD bazı: değerleri enflasyona göre ya da dolar cinsinden görün.",
+      "Banka filtreleri (Katılım / Mevduat / Rakip / İlk 20); bir bankaya sağ tıklayıp görünümden çıkarabilirsiniz.",
+      "İngilizce sürüm: menüdeki 🌐 TR | EN anahtarıyla.",
+      "Telefon ve tablet görünümü, menü ve Excel dışa aktarım ekranı yenilendi; tüm bankaların logoları eklendi.",
+      "Daha hızlı: veri yüklemeden sonra sayfa çok daha çabuk açılıyor."
+    ]
+  },
+  {
+    "version": "v2.2",
+    "date": "2026-09-25",
+    "title": "Mobil görünüm baştan elden geçirildi, Dışa Aktar düzeltildi",
+    "items": [
+      "Ölçü bilgi kartı telefonda alttan açılan panel olarak açılıyor, artık ekrandan taşmıyor.",
+      "iPhone'da arama ve seçim kutularına dokununca sayfa yakınlaşmıyor.",
+      "Telefonda sayfa kaydırması düzgün: adres çubuğu küçülüyor, üste dokununca başa dönülüyor.",
+      "Trend grafiği telefonda okunur boyutta; seri adları ve son değerleri grafiğin altında.",
+      "Rakip Bankalar Trend grafiği telefonda okunur, değer etiketleri üst üste binmiyor.",
+      "Telefonda liste içinde ayrı kaydırılan kutular kaldırıldı; banka seçim çipleri yana kayıyor.",
+      "Dışa Aktar'da Banka Grupları seçildiğinde değerler artık görünüyor.",
+      "Telefonda ölçü seçicileri tek satırlık özete katlanıyor — veriler ilk ekranda; 'Değiştir'e dokununca açılıyor.",
+      "Telefonda YtD büyüme grafiği yatay liste: 27 bankanın hepsi ve Kuveyt Türk görünür; banka adları kısaltılmış, kesilmiyor.",
+      "Grafiklerde parmakla dokunup sürükleyerek dönemler arasında gezinilebiliyor.",
+      "Butonlar ve sekmeler dokunmaya uygun boyutta; tablet için iki sütunlu düzen.",
+      "Rakip Bankalar listesi tanımlı gruptan geliyor (grup değişirse kartlar ve dipnot da değişir)."
+    ]
+  },
+  {
+    "version": "v2.1",
+    "date": "2026-09-24",
+    "title": "Yenilenen Ölçü Oluştur",
+    "items": [
+      "Ölçü Oluştur yenilendi: ölçü listelerinde arama, kaydetmeden önce canlı önizleme, geçersiz kombinasyonlarda anında açıklama ve otomatik ad önerisi.",
+      "Özel ölçüler için otomatik bilgi kartı ve kaydettikten sonra tek tıkla dashboard'da açma."
+    ]
+  },
+  {
+    "version": "v2.0",
+    "date": "2026-09-23",
+    "title": "İlk 20 Banka filtresi",
+    "items": [
+      "\"İlk 20 Banka\" filtresi artık seçili dönemde aktif büyüklüğü en yüksek 20 bankayı gösteriyor (önceden seçili kalemin ilk 20'si geliyordu); bankalar seçili ölçüye göre sıralı."
+    ]
+  },
+  {
+    "version": "v1.9",
+    "date": "2026-09-22",
+    "title": "Mobil görünüm iyileştirmeleri",
+    "items": [
+      "Banka listesi başlıkları seçilen filtreye göre değişiyor (ör. \"Katılım Bankaları Büyüklükleri\").",
+      "Mobilde üst başlıkta yalnızca KT logosu kalıyor; tarih, ölçü arama ve kategori seçimleri aynı hizada.",
+      "Mobilde YtD büyüme grafiğindeki rakamlar barlarının tam üstünde duruyor.",
+      "Rakip Bankalar Yıllık Görünüm tekrar sabit son 3 yıl (dönem seçici kaldırıldı)."
+    ]
+  },
+  {
+    "version": "v1.5",
+    "date": "2026-09-18",
+    "title": "Grafikler animasyonlu hale getirildi",
+    "items": [
+      "Trend grafiklerindeki çizgiler artık soldan sağa \"çizilerek\" beliriyor; ölçü/tarih/dönem değiştirildiğinde animasyon tekrar oynuyor.",
+      "Banka sıralaması, YtD Büyüme ve Kompozisyon bar grafiklerinde değerler değiştiğinde barlar anlık zıplamak yerine yumuşakça yeni boyutuna geçiyor.",
+      "Rakip Bankalar kartlarının üstüne gelince açılan mini grafikte barlar sırayla aşağıdan yukarı büyüyerek beliriyor."
+    ]
+  },
+  {
+    "version": "v1.4",
+    "date": "2026-09-18",
+    "title": "Ölçü info baloncukları eklendi",
+    "items": [
+      "ÖLÇÜ seçicisinin yanına bir bilgi (i) butonu eklendi; üzerine gelince (veya dokunmatikte tıklayınca) seçili ölçünün Tanımı, Formülü, hesaplama dönemi, kaynağı ve ilgili terimlerin açıklaması küçük bir baloncukta açılıyor.",
+      "Baseline/placeholder gibi özel durumdaki ölçülerde bunu belirten bir rozet ve uyarı notu da gösteriliyor."
+    ]
+  },
+  {
+    "version": "v1.3",
+    "date": "2026-09-16",
+    "title": "Baloncuklar küçültüldü, sürüm takibi ve haftalık özet düzeni eklendi",
+    "items": [
+      "Rakip Bankalar baloncukları küçültüldü; artık ekran kenarına taşmayacak, her zaman tek ekranda tam görünecek şekilde konumlanıyor.",
+      "Üst menüdeki \"Yenilikler\" butonu artık güncel sürüm numarasını gösteriyor.",
+      "Bundan sonra yapılan işler, versiyon numarasıyla birlikte kısa madde listesi halinde burada takip edilecek."
+    ]
+  },
+  {
+    "version": "v1.2",
+    "date": "2026-09-16",
+    "title": "Tüm bankalar ve interaktif Rakip Bankalar kartları",
+    "items": [
+      "Banka sıralama listeleri artık ilk 20 değil TÜM bankaları gösteriyor (ilk görünümde 20 banka, aşağı kaydırınca tümüne ulaşılıyor).",
+      "Rasyo bazlı Banka Grupları kartlarındaki boş alanlar azaltıldı.",
+      "Rakip Bankalar kartları tek sıraya alındı; üzerine gelince/tıklayınca detaylı grafik açan interaktif baloncuklara geçildi.",
+      "Rakip Bankalar trend grafiğine, diğer trend grafikleriyle tutarlı hover ipucu (tarih + değerler) eklendi.",
+      "Uygulama genelinde küçük yazılar büyütüldü, mobilde taşan değerler düzeltildi."
+    ]
+  },
+  {
+    "version": "v1.1",
+    "date": "2026-09-12",
+    "title": "Üyelik sistemi ve mobil uyum (2026-08-25 → 2026-09-12 özeti)",
+    "items": [
+      "Üyeler artık kayıt olup onayla giriş yapabiliyor; kullanıcılara rol atanabiliyor.",
+      "KT marka logosu/renkleri arayüze eklendi; \"Rakip Bankalar\" gibi banka grupları düzenlenebiliyor.",
+      "Dashboard mobil uyumlu hale getirildi (hamburger menü, kırpılan yazılar düzeltildi).",
+      "Banka sıralama listeleri ve trend grafikleri daha okunaklı, tutarlı bir tasarıma kavuştu."
+    ]
+  },
+  {
+    "version": "v1.0",
+    "date": "2026-08-25",
+    "title": "Arayüz iyileştirmeleri",
+    "items": [
+      "Ölçü seçicisine arama kutusu eklendi — istediğiniz ölçüye tüm kategorilerde hızlıca ulaşabilirsiniz.",
+      "Şube & Personel ölçülerinde yıllık büyüme artık yüzde yerine miktar olarak gösteriliyor, daha net bir karşılaştırma sağlıyor.",
+      "Koyu modda bazı sekmelerin okunamaması sorunu giderildi.",
+      "Bu \"Yenilikler\" penceresi eklendi — önemli güncellemeler artık buradan takip edilebilecek."
+    ]
+  }
+]

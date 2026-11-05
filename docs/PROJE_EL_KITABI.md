@@ -1,0 +1,2549 @@
+# KT Rakip Analizi — Proje El Kitabı
+
+**Son güncelleme:** 2026-09-08 · **Hedef okuyucu:** projeyi devralacak geliştirici
+
+Bu dosya projenin **tek doğru kaynağıdır**: ne olduğu, nasıl çalıştığı, nasıl
+işletildiği, bugüne kadar ne yapıldığı ve bundan sonra ne yapılacağı burada.
+Daha önce bu bilgi `BACKLOG.md`, `PDF_FAZI_YOL_HARITASI.md` ve `CONTEXT.md`
+arasında dağılmıştı; üçü bu dosyada birleştirildi ve kaldırıldı.
+
+**Okuma sırası önerisi**
+1. Projeyi hiç bilmiyorsanız: §1 → §2 (çalıştırın) → §3 (nasıl çalışıyor)
+2. Veri yükleyecekseniz: §4 (işletme) — özellikle §4.2
+3. Koda dokunacaksanız: §5 (tuzaklar) **önce okunmalı**, sonra §3
+4. "Neden böyle yapılmış?" sorusu için: §9 (kararlar günlüğü) ve §6 (kronoloji)
+
+**Derinlik dokümanları** (bu dosya özetler, detay oradadır):
+`docs/ARCHITECTURE.md` (storage şeması) · `docs/MEASURES.md` (160 ölçünün
+formülleri) · `docs/MEASURE_LISTESI.md` · `docs/EXTENDING.md` (yeni ölçü/banka
+/grup ekleme adımları) · `docs/DATA_MIGRATION.md` (sunucu göçü) ·
+`docs/CHANGELOG.md` (sürüm geçmişi)
+
+---
+
+## 1. Proje nedir
+
+Türk bankacılık sektörü için **rakip analiz dashboard'u**. BDDK'nın kamuya
+açık çeyreklik verilerinden beslenir; Kuveyt Türk'ün rakipleri karşısındaki
+konumunu büyüklük, pazar payı, büyüme ve rasyo bazında gösterir.
+
+**Sahibi:** Kuveyt Türk Strateji ekibi
+
+**Bir bakışta**
+
+| | |
+|---|---|
+| Banka | 27 |
+| Dönem | 51 çeyrek (2013-12-31 → 2026-06-30) |
+| Ölçü | 160 (147'si ham veriden hesaplanıyor, 13'ü dış kaynaktan taşınıyor) |
+| Ham veri | ~1.193 xlsx, 2,85M satır konsolide |
+| Banka grubu | 5 (Kuveyt Türk, Mevduat Bankaları, Rakip Bankalar, Katılım Bankaları, KT Hariç Katılım) |
+| Görünüm | 4 mod: Anında Görünüm, Trend, Kompozisyon, Dışa Aktar |
+| Test | 66 (pytest) |
+
+**Neyi çözüyor:** Daha önce bu analiz, dışarıdan satın alınan hazır Excel
+çıktıları (Rasyonet) ve elle hazırlanan PowerBI raporlarıyla yapılıyordu.
+Sistem, ham BDDK verisinden başlayıp tüm rasyoları kendisi hesaplayarak bu
+bağımlılığı kaldırmayı hedefliyor — bu geçiş hâlâ sürüyor (bkz. §8.3).
+
+---
+
+## 2. Hızlı başlangıç
+
+**Gereksinimler:** Python 3.11+, ~500 MB disk (veri dahil)
+
+```bash
+cd "Rakip Analizi"
+pip install -r requirements.txt
+./start.sh                      # http://127.0.0.1:8000
+```
+
+> ⚠️ **`python3 app.py` ile başlatmayın.** `start.sh`, admin şifresini ve
+> ultra-admin kimliğini ortam değişkeni olarak verir; doğrudan çalıştırma
+> zayıf varsayılan şifreye düşer.
+
+**Giriş:** Dashboard üyelik ister. Admin, kendi Basic Auth şifresiyle
+`/login` üzerinden `{KT_USERNAME}@admin.local` hesabıyla girer (bu hesap her
+açılışta otomatik senkronlanır). Admin paneli ayrıca `/admin` adresinde
+HTTP Basic Auth ile korunur.
+
+**Testler:**
+```bash
+python3 -m pytest tests/ -q     # 66 test
+```
+
+**Kod değiştirdiyseniz sunucuyu yeniden başlatın** — `uvicorn` `reload=False`
+ile çalışıyor (bilinçli: tek worker garantisi için, bkz. §5).
+
+---
+
+## 3. Sistem nasıl çalışıyor
+
+### 3.1 Veri akışı
+
+```
+BDDK xlsx (1 banka × 1 dönem)
+      │  pipeline/ingest.py — parse + kalite kontrolü
+      ▼
+data/raw/<Banka>/<Banka> - GG.AA.YYYY.xlsx        ← ham arşiv, dokunulmaz
+      │  update_parquet_incremental / rebuild_parquet
+      ▼
+data/veriler.parquet    (long format, 2,85M satır)
+      │  pipeline/compute.py  → measures.py (147 ölçü)
+      │  pipeline/groups.py   → grup toplamları
+      │  pipeline/composition.py → kompozisyon + TP/YP
+      ▼
+data/computed.json      (dashboard'un okuduğu tek dosya, ~10 MB)
+      │  FastAPI /api/data
+      ▼
+frontend/index_v30.html (React, CDN — build adımı yok)
+```
+
+**Temel ilke:** Frontend hesaplama yapmaz. Yeni bir ölçü eklemek yalnızca
+pipeline tarafını ilgilendirir; frontend `computed.json`'u render eder.
+
+### 3.2 Dosya yapısı
+
+```
+app.py                 FastAPI backend — tüm route'lar, auth, admin uçları (~2.000 satır)
+users.py               üyelik katmanı (bcrypt + imzalı çerez)
+catalog.seed.json      ölçü/kompozisyon/banka tanımları (git-tracked kaynak)
+whats_new.json         "Yenilikler" penceresi içeriği
+
+pipeline/
+  ingest.py            xlsx → parquet, kalite kontrolü, dosya adı doğrulama
+  lookup.py            LookupContext — parquet üzerinde kalem arama
+  measures.py          147 ölçünün formülleri (en büyük dosya, ~1.365 satır)
+  groups.py            grup toplamları / ağırlıklı rasyolar
+  composition.py       kompozisyon ve TP/YP dağılımı
+  compute.py           orkestratör (compute_all)
+  datatable.py         ESKİ — PowerBI export yolu, artık kullanılmıyor
+
+frontend/
+  index_v30.html       dashboard (React CDN, ~4.800 satır, tek dosya)
+  admin.html           admin paneli
+  login.html, signup.html
+  logos/               banka logoları
+
+scripts/               CLI araçları (init_data, recompute, export_data_snapshot…)
+tests/                 pytest (66 test)
+data/                  GİT'TE DEĞİL — canlı veri (bkz. §5)
+```
+
+### 3.3 Veri formatları
+
+**`data/veriler.parquet`** — long format, 8 kolon:
+
+| Kolon | Tip | Açıklama |
+|---|---|---|
+| Tarih | datetime | Çeyrek sonu |
+| Banka Adı | category | Görünen ad ("Kuveyt Türk") |
+| Banka Türü | category | Mevduat \| Katılım |
+| Tablo Türü | category | Ana Tablo \| … |
+| Tablo Adı | category | Bilanço, Gelir Tablosu, Şube-Personel… (45 tablo) |
+| Kalem Adı | category | BDDK kalem adı, orijinal Türkçe (1.891 farklı kalem) |
+| Para Birimi | category | Toplam \| TP \| YP |
+| Tutar | float64 | TL |
+
+**`data/computed.json`** — dashboard payload'u:
+```
+meta              banka listesi, gruplar, tarihler, kapsam, top-20
+catalog           160 ölçünün metadata'sı
+bank_data         [ölçü][banka][tarih] = değer
+group_data        [ölçü][grup][tarih] = {value: …}
+composition_data  5 kompozisyon
+currency_data     4 TP/YP dağılımı
+timestamp         üretim zamanı
+```
+
+**`catalog.seed.json` ↔ `data/catalog.json`** — seed git'te tutulur (ölçü/
+kompozisyon/banka tanımları = kod), runtime kopyası `data/`'da yaşar ve
+admin panelden düzenlenen **grup üyeliklerini** korur. Açılışta seed'den
+senkronlanır: config tazelenir, gruplar korunur.
+
+### 3.4 Ölçü sistemi
+
+- **`MEASURE_FUNCS` (147)** — ham veriden hesaplanır. Her fonksiyonun
+  docstring'inde DAX-eşdeğer formülü vardır.
+- **`BASELINE_PASSTHROUGH` (13)** — ham BDDK verisinde karşılığı olmayan ya
+  da henüz türetilmemiş ölçüler (SYR, Çekirdek SYR, NIM, Spread, RORWA,
+  Maliyet/Gelir…). Bunlar eski PowerBI baseline'ından **taşınır**, yani her
+  yeni çeyrekte bir dönem geride kalırlar. Bu bilinçli bir borç ve
+  kapatılması planlanıyor (§8.3, FAZ 3).
+
+Ölçü metadata'sı: `id, ad, tip (buyukluk|rasyo), akim_stok, birim, kategori,
+alt_kategori, pazar_payi, sort_direction`. **Açıklama alanı henüz yok** —
+bilgi baloncukları fazında eklenecek (§8.3, FAZ 4).
+
+Yeni ölçü ekleme adımları: `docs/EXTENDING.md`.
+
+### 3.5 Grup katmanı ve kısmi çeyrek kuralı
+
+Grup toplamları `pipeline/groups.py`'da **tek yerde** tanımlıdır; hem
+`app.py` hem `scripts/recompute.py` aynı fonksiyonu çağırır.
+
+- Büyüklükler: üyelerin toplamı
+- Rasyolar: **ağırlıklı ortalama** (Σpay / Σpayda) — basit ortalama değil
+
+**Kritik kural:** Bir grup, üyelerinden biri o dönemi raporlamamışsa `None`
+("—") döner. Yanıltıcı küçük toplam üretmektense veri yok demeyi tercih
+ediyoruz. "Banka henüz kurulmamış" ile "bu çeyreği henüz raporlamadı" ayrımı
+`first_date_map` ile yapılır (bkz. §5).
+
+### 3.6 Kimlik doğrulama — iki ayrı katman
+
+| Katman | Kim | Nasıl | Neye erişir |
+|---|---|---|---|
+| **Basic Auth** | Kök admin | `KT_USERNAME` / `KT_PASSWORD` | `/admin` paneli, tüm admin uçları |
+| **Üyelik oturumu** | Üyeler | `/signup` → admin onayı → `/login` | Sadece `/api/data`, `/api/catalog` |
+
+Onaylı bir üyeye admin panelden `role='admin'` verilebilir — bu, Basic Auth
+ile **eş değer tam yetki** demektir (kısmi yetki yok). Ayrıca tek hesaba özel
+**ultra admin** katmanı vardır (`KT_ULTRA_ADMIN_EMAIL`): diğer adminler bu
+hesabı üye listesinde göremez ve üzerinde işlem yapamaz.
+
+### 3.7 Koruma katmanları
+
+Veri yazan her akışta sırayla:
+
+1. **Ağır işlem kilidi** — upload/rebuild aynı anda çalışamaz (409 döner)
+2. **Kalite kontrolü** — bozuk xlsx `data/raw/`'a hiç yazılmaz
+3. **Otomatik yedek** — `_backup_computed()`, son 5 kopya `data/backups/`
+4. **Boşluk kilidi** — sonuç tamamen boşsa yazma
+5. **Regresyon kilidi** — sonuç mevcut veriden küçükse (ölçü/banka/dönem
+   düşüyor ya da dolu hücre %2'den fazla azalıyor) **409 ile reddedilir**;
+   admin panelde "Veri azalmasına izin ver" kutusuyla bilinçli olarak
+   zorlanabilir
+6. **Atomik yazım** — `.tmp` + `replace`
+7. **Açılışta kurtarma** — `computed.json` bozuksa son sağlam yedeğe dönülür,
+   bozuk dosya `computed.corrupt_<zaman>.json` olarak saklanır ve admin
+   panelde uyarı gösterilir
+
+---
+
+## 4. İşletme rehberi
+
+### 4.1 Yeni çeyrek yükleme
+
+1. 27 bankanın xlsx'ini `<Banka Adı> - GG.AA.YYYY.xlsx` formatında hazırla
+   (tarih çeyrek sonu olmalı: 31.03 / 30.06 / 30.09 / 31.12)
+2. `/admin` → **📤 Veri Yükleme** → dosyaları sürükle
+3. Sistem sırasıyla: yedek alır → her dosyayı doğrular → `data/raw/`'a yazar
+   → parquet'i **sadece yeni dosyalar için** günceller → tüm bankalar için
+   ölçüleri yeniden hesaplar → `computed.json`'u atomik yazar
+4. **Veri Durumu** sekmesinden kapsamı doğrula (ör. "27 / 27")
+
+Süre: 27 dosya ≈ 40 saniye.
+
+### 4.2 Upload vs Rebuild — bunu karıştırmayın
+
+| | **Upload** | **Rebuild** |
+|---|---|---|
+| Ne yapar | Sadece yüklenen dosyaları işler, mevcut veriye **ekler** (upsert) | `data/raw/`'ın **tamamını** okuyup her şeyi sıfırdan hesaplar |
+| Ne zaman | **Normal çeyrek güncellemesi — varsayılan bu** | Pipeline'da formül değişikliği yaptıysanız |
+| Risk | Yok; aynı banka+tarih temiz şekilde değişir | Sunucuda ham arşiv eksikse **geçmişi siler** |
+
+> 🔴 2026-08-19'da canlıda Rebuild'e basıldı; sunucuda ham arşiv olmadığı
+> için 51 dönemlik geçmiş silinip yerine 1 dönem yazıldı. Bugün regresyon
+> kilidi bunu durdurur, ama **canlıda Rebuild'e basmayın** — ham arşiv
+> yalnızca yerel makinede.
+
+### 4.3 Sunucu taşıma
+
+İki yol var, ikisi de `docs/DATA_MIGRATION.md`'de adım adım:
+
+- **Admin panelden (SSH gerekmez, önerilen):** `/admin` → Sunucu Taşıma →
+  "Veriyi İndir" → hedef sunucuda "İçe Aktar". Paket içinde manifest vardır
+  (kaç ölçü/banka/dönem, hangi tarihe kadar) — yüklemeden önce doğrulayın.
+- **CLI (SSH varsa):** `python scripts/export_data_snapshot.py` → `scp` →
+  Docker volume'a aç → `chown -R 10001:10001` → container restart.
+
+> **`data/` klasörünü asla elle zip'leyip taşımayın.** Git'te olmadığı için
+> hangi kopyanın güncel olduğu belirsizleşir; 2026-08'de tam bu yüzden bir
+> sunucuda Eylül 2025'te donmuş veri yayına çıktı.
+
+### 4.4 Yedekleme ve kurtarma
+
+- Her yazım öncesi otomatik: `data/backups/computed_<zaman>.json` (son 5)
+- Elle tam yedek: `computed.json` + `veriler.parquet` kopyalayın
+- `computed.json` bozulursa: sistem açılışta kendi kurtarır; müdahale
+  gerekmiyorsa yalnızca admin panelindeki uyarıyı okuyun
+
+### 4.5 Canlı ortam
+
+| | |
+|---|---|
+| Deploy | `main`'e push = otomatik deploy |
+| Veri | Kalıcı Docker volume (`/app/data`), uid 10001 |
+| Container | Non-root, healthcheck'li, tek worker |
+
+**Kod ve veri birbirinden bağımsızdır:** push kodu günceller, `data/` volume'a
+dokunmaz. Yeni sunucuya taşırken kod GitHub'dan gelir ama **veri gelmez** —
+§4.3'teki yöntemlerden birini kullanın.
+
+---
+
+## 5. Tuzaklar — koda dokunmadan önce okuyun
+
+Bunların her biri gerçekten yaşandı ve zaman kaybettirdi.
+
+1. **NFD / NFC Türkçe karakter tuzağı (3 kez düşüldü).** macOS dosya adlarını
+   NFD (ayrışık), JSON'lar NFC (birleşik) saklar. `"Dünya Katılım" ==
+   "Dünya Katılım"` **sessizce `False` döner**. Karşılaştırmadan önce her iki
+   tarafı da `unicodedata.normalize('NFC', s)` yapın.
+
+2. **NBSP (`\xa0`) tuzağı.** BDDK ham verisinde bazı kalem/tablo adlarında
+   normal boşluk yerine kırılmaz boşluk var. Normalize edilmezse ölçü %0,49
+   çıkar (gerçeği %14,95). `LookupContext` bunu kategori etiketlerinde yapar
+   (2026-09-29); sütunları `astype(str)` ile metne çevirmek 4+ GB bellek
+   yiyordu — geri almayın.
+
+2a. **`LookupContext._fast` ile `_idx` birlikte yaşar.** Hesaplama düz
+   sözlükten (`_fast`) okur; `TracingLookupContext` (cikti_diagnostics) hâlâ
+   pandas `_idx`'i kullanır. Birini değiştiren diğerini de güncellemeli;
+   `tests/test_lookup_fast.py` ikisinin aynı sonucu verdiğini denetler.
+
+3. **`reload=False` — kod değişince sunucu restart şart.** Bilinçli tercih:
+   tek worker garantisi (kilitler ve rate-limit in-process).
+
+4. **Tek worker zorunlu.** `users.json` kilidi, ağır işlem kilidi ve login
+   rate-limit hepsi in-process. `--workers>1` bunları bozar.
+
+5. **`ensure_data_dir()` sadece MainProcess'te.** `ProcessPoolExecutor`
+   worker'ları `app.py`'yi yeniden import ediyor; bu kontrol olmazsa her
+   worker `users.json`'a yazmaya çalışıp `BrokenProcessPool` üretiyor.
+
+6. **Grup, eksik üyede `None` döner — SADECE `_agg_size` (SUM) için.**
+   (2026-09-16 değişti, bkz. Dönem 26/v1.2) `_agg_ratio` ve
+   `_agg_simple_avg` artık bu ölçüde verisi/uygulanabilirliği olmayan
+   üyeyi HARİÇ TUTUP kalanlarla hesaplıyor, `None` dönmüyor — kullanıcı
+   kararı: "verisi olmayanları exclude, veri yüklendikçe include".
+   `_agg_size`'da hâlâ eski davranış geçerli (bir SUM'da sessizce
+   dışlamak toplamı gerçekte olduğundan küçük gösterir).
+
+7. **`data/` git'te değildir.** Bilinçli: `git pull` canlı veriyi ezmesin
+   diye. Sonucu: kod ile veri ayrı taşınır (§4.3).
+
+8. **12 passthrough ölçü bir dönem geride.** Yeni çeyrek yüklediğinizde
+   SYR/NIM/RORWA boş görünür — bu bug değil, bilinen borç (§8.3 FAZ 3).
+   `gayrinakdi_krediler` 2026-09-09'da bu listeden çıkıp raw'a taşındı
+   (Dönem 9) — aynı doğrulama (baseline'la örtüşme ölçümü) yapılmadan
+   kalan 12'si taşınmamalı.
+
+9. **Excel dosya adı bilgi taşır.** Banka ve dönem dosya adından okunur;
+   format bozuksa dosya reddedilir.
+
+---
+## 6. Ne yapıldı — kronoloji
+
+Projenin başından bugüne dönem dönem: ne yapıldı, hangi bug bulundu,
+hangi karar neden alındı. Bir davranışın nedenini ararken buraya bakın.
+
+> **Format notu (2026-09-16, kullanıcı kararı):** haftalık toplantılarda o
+> hafta ne yapıldığı belirsiz kalıyordu. **Dönem 26'dan itibaren** yeni
+> girdiler eski uzun/teknik anlatı yerine kısa madde listesi + ilgili
+> `whats_new.json` sürüm numarasıyla yazılır (bkz. altta). Eski Dönem
+> 0-25 girdileri (detaylı) değiştirilmedi — geçmiş referans olarak kalıyor.
+
+
+### Dönem 0 — İlk kuruluş ("2025-05" etiketli, devir öncesi dönem)
+
+Kaynak: `docs/CHANGELOG.md`. Bu dönemin git karşılığı yok (repo henüz git'e
+alınmamıştı).
+
+- **Faz 1 — Repo İskeleti.** İlk tasarım: README/ARCHITECTURE/MEASURES/
+  EXTENDING/DEPLOYMENT dokümantasyonu, `pipeline/` modülleri (lookup, measures,
+  groups, ingest, compute), `scripts/` (init_data, recompute), `data/catalog.json`
+  + `display_config.json`.
+- **v17 — Kompozisyon modu.** 5 kompozisyon × stack chart, banka/grup × tarih
+  filtreleri, Bileşen/Döviz alt-sekmeleri.
+- **v17 → v26 (9 iterasyon, özet).** Trend modu görünümleri (Değer/YtD/YoY/QoQ
+  Büyüme/Pazar Payı) eklendi. TP/YP refactor denendi, BDDK detayında TP/YP
+  olmayan kalemler nedeniyle **geri alındı** — yerine ana kalem üzerinden
+  2-segmentli döviz dağılımı yaklaşımına geçildi. Snapshot'ta cascading dropdown
+  (Kategori → Alt Kategori → Measure), sabit top-20 set'i, YtD yatay liste
+  grafiği kuruldu.
+- **v27 — Export modu.** 4. mode: banka/grup multi-select × tarih aralığı ×
+  hiyerarşik measure ağacı → wide-format tablo + Excel/CSV indirme. SheetJS
+  (CDN) + bağımlılıksız CSV fallback (UTF-8 BOM + `;` ayraç + ondalık virgül,
+  Türkçe Excel uyumlu).
+- **v28 — Pasifler wrap bug fix.**
+- **v29 — Yeni 21 measure aktivasyonu.**
+- **Faz 1.5 — Ham BDDK'dan tam hesaplama pipeline'ı.** v29'daki 128 measure'ın
+  tamamını raw BDDK xlsx'lerinden Python ile yeniden üretme hedefi. Sonuç: KT
+  2025-Q3'te 102/102 raw measure v29 baseline ile birebir eşleşti; 27 banka ×
+  48 çeyrek × 128 measure'da **%91,8 exact match**. `MEASURE_FUNCS` (104) +
+  `BASELINE_PASSTHROUGH` (24, raw'dan türetilemeyen kalemler) mimarisi kuruldu.
+  **Kritik NBSP encoding bug'ı** bulundu: BDDK ham verisinde bazı kalem/tablo
+  adlarında normal boşluk yerine non-breaking space (`\xa0`) var — normalize
+  edilmeden `dis_ticaret_toplam` %0,49 (gerçek %14,95) çıkıyordu.
+
+---
+
+### Dönem 1 — Veri kaynağı arayışı (2026-08-02 → 2026-08-09)
+
+- **2026-08-02:** `data/raw/` boş olduğundan, `datatable_1.xlsx` (zaten
+  hesaplanmış PowerBI export'u) geçici birincil kaynak yapıldı
+  (`scripts/load_datatable.py`, `pipeline/datatable.py`). Bu, `measures.py`/
+  `groups.py`/`lookup.py`'yi fiilen ölü koda çeviriyordu — bilinen bir risk
+  olarak not edildi.
+- **2026-08-09:** Kullanıcı tam ham BDDK arşivini sağladı: **27 banka ×
+  2013-Q4→2026-Q1, 1.170 dosya**, hepsi doğrulandı (dosya adı, banka eşleşmesi,
+  KT 2025-09-30 referans değeriyle birebir). "Ham veriye geç, denetlediğimiz
+  formülleri kullan" talimatıyla `measures.py`/`groups.py`/`lookup.py` yeniden
+  birincil hesaplama yolu oldu; datatable dönemi geçmişe düştü.
+- **2026-08-09 — kritik bug:** `/admin/rebuild`, `compute_all`'ı `base_data={}`
+  ile çağırıyordu — bu, ham BDDK'da hiç bulunmayan 13 `BASELINE_PASSTHROUGH`
+  measure'ı (SYR, Çekirdek SYR, RORWA, NIM, Spread vb.) **her rebuild'de
+  siliyordu**. Düzeltme: rebuild artık mevcut computed.json'daki passthrough
+  değerlerini `base_data` olarak taşıyor (self-sustaining).
+- **2026-08-09 — tekrarlayan hata (3. kez):** macOS Türkçe karakterli dosya
+  adlarını **NFD** (ayrışık), `catalog.json` **NFC** (birleşik) saklıyor — düz
+  string karşılaştırması görsel olarak özdeş string'lerde bile sessizce
+  `False` dönüyordu. 3 farklı yerde (logo embed script'i, "Rakip Analizi
+  Veriler" doğrulaması, parquet banka adı filtresi) aynı hataya düşüldü.
+  Kalıcı kural: karşılaştırmadan önce her iki tarafı da `NFC`'ye normalize et.
+
+---
+
+### Dönem 2 — Veri kalitesi, admin panel, performans (2026-08-09 → 2026-08-11)
+
+- **2026-08-09 — `/admin/upload` 3 bug:**
+  1. **422 hatası** — backend tekil `file`, frontend çoğul `files` gönderiyordu,
+     upload hiç çalışmıyordu.
+  2. **N dosya = N kere tam pipeline** (potansiyel 40 dk) — düzeltme: tüm
+     dosyalar önce kaydedilir, pipeline tek sefer çalışır.
+  3. **Kritik veri kaybı** — üzerine yazma + hata senaryosunda rollback, VAR
+     OLAN dosyayı siliyordu (gerçekten oldu: Akbank/Denizbank 2014-06-30
+     kaybedildi, orijinal kaynaktan geri yüklendi). Düzeltme: eski içerik
+     belleğe alınır, hata durumunda geri yazılır.
+  4. Aynı gün: `rebuild_parquet` `ProcessPoolExecutor` ile paralelleştirildi
+     (10 çekirdek) — 1170 dosyalık arşivde 70,7sn → 14,8sn.
+- **2026-08-11 — "Gerçek BDR" arşivine geçiş.** Kullanıcı "Rakip Analizi Güncel
+  BDR'ler" klasörünü sağladı (22 banka, 1.117 dosya). 4 banka (Dünya Katılım,
+  Emlak Katılım, Enpara, Hayat Finans) bu klasörde yoktu — eski arşivden
+  dokunulmadan korundu. Sonuç: `data/raw/` 1.176 dosya, 27/27 banka.
+- **2026-08-11 — veri kalitesi taraması.** Sistematik kontrol (Toplam Aktifler
+  boş mu, aşırı `#VALUE!` var mı, temel measure'larda >%50 düşüş var mı) şunu
+  buldu: **QNB Finansbank** (2013-2024 arası 42 dosya, Bloomberg/FactSet
+  eklentisi olmadan export edilmiş, `#VALUE!` dolu), **Kuveyt Türk** (4 eski
+  dosya boş hücreli), **Türkiye Finans** (5 dosya), **TOM Bank** (4 dosya),
+  **HSBC** (1 dosya kısmen bozuk), **TEB** (1 dosya NFD/NFC yüzünden "var"
+  gözükürken aslında yoktu), **Vakıf Katılım + Ziraat Katılım** (13 erken dönem
+  dosyası, muhtemelen banka henüz kurulmamış → silindi, yanlış "0" göstermek
+  yerine "veri yok" tercih edildi). 61 dosya eski arşivden geri yüklendi, 13
+  dosya silindi.
+- **2026-08-11 — otomatik kalite kontrolü.** `check_data_quality()` eklendi —
+  upload öncesi Toplam Aktifler dolu mu / aşırı `#VALUE!` var mı kontrol eder,
+  başarısızsa dosya `data/raw/`'a hiç yazılmaz.
+- **2026-08-11 — incremental parquet güncelleme.** `update_parquet_incremental`
+  — tek dosyalık upload artık TÜM 1176 dosyayı değil sadece yüklenen dosyayı
+  okur (52sn → 33sn). `compute_all`/`build_group_data`/`composition` adımları
+  BİLEREK hâlâ full-recompute (grup toplamları tüm bankaların güncel verisine
+  muhtaç).
+- **2026-08-11 — regresyon test suite.** `tests/` + pytest kuruldu (27 test):
+  grup agregasyon birim testleri, veri kalitesi testleri, golden-value
+  spot-check (KT+Akbank, 2018-12-31 referans).
+- **2026-08-11 — coverage endpoint bug.** `/api/admin/coverage` yanıtında
+  `banks_missing_latest` alanı hiç yoktu → "eksik banka" sayısı hep 0
+  gösteriyordu, iki admin panel kutusu birbiriyle çelişiyordu.
+- **2026-08-11 — kısmi çeyrek grup agregasyonu (3 bağımsız bug, aynı kök
+  aileden):**
+  1. Grup toplamları (Mevduat Bankaları vb.), üyelerden biri eksikse sessizce
+     onu dışlayıp yanıltıcı küçük toplamlar üretiyordu → düzeltme: TÜM üyeler
+     veri sağlamazsa `None` ("—") dönsün.
+  2. Bu düzeltmenin YAN ETKİSİ: "banka henüz kurulmamış" (ör. Enpara ilk
+     raporlama 2024-12-31) ile "banka bu çeyreği henüz raporlamadı" ayırt
+     edilmiyordu — Mevduat Bankaları grubu 51 çeyrekten sadece 6'sında dolu
+     çıkıyordu. `first_date_map` + `_active_members` ile düzeltildi.
+  3. Frontend'de pazar payı hesabı da aynı sorundan etkileniyordu (kısmi
+     çeyrekte payda küçülüp herkesin payı yapay şişiyordu) — `date_coverage`
+     ile "güvenilir tarih" kontrolü eklendi.
+- **2026-08-11 — güvenlik.** Sunucu `0.0.0.0`'a (ağdaki herkese açık) bağlıydı
+  → `127.0.0.1`'e sabitlendi. Varsayılan admin şifresi zayıftı (`faruk`/
+  `faruk123`) → `start.sh` ile güçlü şifre zorunlu kılındı.
+
+---
+
+### Dönem 3 — Üyelik, roller, formül hizalama, marka (2026-08-12)
+
+- **Üyelik sistemi.** Açık kayıt (`/signup`) + admin onaylı giriş. İki ayrı
+  yetki seviyesi: Basic Auth (admin, upload/rebuild) ve session tabanlı üyelik
+  (`users.py`, bcrypt + `itsdangerous` imzalı çerez, sadece `/api/data` okuma).
+  Admin, kendi Basic Auth şifresiyle de dashboard'a girebiliyor
+  (`{KT_USERNAME}@admin.local`, `upsert_admin_account` ile otomatik senkron).
+- **Rol tabanlı admin + banka grupları.** Onaylı bir üyeye "Admin Yap"
+  denilince Basic Auth ile EŞ DEĞER tam yetki veriliyor. "Rakip Bankalar" gibi
+  gruplar artık admin panelden CRUD edilebiliyor (`/api/admin/groups`), "Kuveyt
+  Türk" grubu silinemez korunuyor.
+- **PowerBI DAX formül hizalama.** Kullanıcının paylaştığı gerçek PowerBI DAX
+  formülleriyle `composition.py` karşılaştırıldı, 4 fark bulundu: Menkul
+  Kıymetler (ürün-türü → TFRS9 sınıflandırma bazlı), **Diğer Aktifler**
+  (residual'dan **açık kalem toplamına** — en kritik fark), Pasif kompozisyon
+  yapısı (Alınan Krediler ayrı bileşen oldu), Diğer Faaliyet Gelirleri
+  (Temettü eksikti). Ayrıca yüzde normalizasyonu (mutlak değer bazlı, her
+  zaman %100'e tamamlanan) uygulandı.
+  **Kritik yan bulgu:** `ensure_data_dir()` modül seviyesinde çağrılıyordu,
+  `ProcessPoolExecutor` worker'ları `app.py`'yi yeniden import edip bunu HER
+  WORKER'DA tekrar tetikliyordu → eşzamanlı `users.json` yazımı yarış
+  durumuna, `BrokenProcessPool` hatasına yol açıyordu. `MainProcess` kontrolü
+  ile düzeltildi.
+- **Dashboard header + tarih seçici.** Topbar'a merkezi KT logo + "Rakip
+  Analizi" marka bloğu. Eski tek dropdown yerine Yıl/Çeyrek buton seçicisi
+  (sonra Yıl, tıklanınca açılan listeye çevrildi).
+
+---
+
+### Dönem 4 — Deploy altyapısı + ölçü genişletme (2026-08-12 → 2026-08-18)
+
+*Bu dönemden itibaren git commit geçmişi var.*
+
+- **2026-08-12:** `git init`, ilk commit ("canlıya alma altyapısı"), GitHub'a
+  private repo olarak push (`beligte10/rakip-analizi`).
+- **~2026-08-14/15:** `measures.docx` (PowerBI DAX referansı) tam tarandı —
+  catalog **127 → 160 ölçü**. 33 yeni measure (RAV, Toplam Risk, Likidite
+  Açığı×7, vade dilimleri, Toplam Brüt/Canlı Krediler vb.) + **9 mevcut
+  ölçünün paydası** ("X/Toplam Krediler" ailesi) net krediler yerine Toplam
+  Brüt Krediler'e düzeltildi. Şube&Personel akım ölçüleri (net kar, personel
+  gideri) TTM ile yıllıklandırıldı — ara çeyreklerdeki "testere-dişi" sorunu
+  giderildi. Grup katmanı (`groups.py`) tüm bu düzeltmelerle senkronize
+  edildi (banka-seviyesi bir formül değişince grup'un da güncellenmesi
+  gerektiği, unutulursa dashboard'da sessiz tutarsızlık yarattığı öğrenildi).
+- **Şifre değiştirme + ultra admin.** Üyeler kendi şifresini değiştirebiliyor.
+  **Ultra admin** — tek bir hesaba (`faruk@admin.local`) özel, diğer
+  adminlerin göremediği/dokunamadığı en üst yetki katmanı (env değişkeniyle
+  tanımlı, UI'dan atanamaz).
+- **catalog.json git'e alındı (seed mimarisi).** `catalog.json` çift doğalıydı
+  (measures/compositions/banks = kod, groups = runtime/admin panelden
+  düzenlenen). `catalog.seed.json` (git-tracked config kaynağı) + startup'ta
+  canlı `groups`'u koruyarak merge eden mekanizma kuruldu — kod↔config
+  uyumsuzluğu (bu turda pasif kompozisyonunda yaşanan) kökten çözüldü.
+- **Deploy denetimi ve sertleştirme (14 madde bulundu, hepsi kapatıldı):**
+  ağır endpoint'lerin (upload/rebuild) event loop'u bloke etmesi (→ `def`'e
+  çevrildi, threadpool), eşzamanlılık kilidi, Dockerfile'ın gereksiz `data/`
+  kopyalaması, prod bayrağı (HTTPS-only çerez + `/docs` kapatma), pinlenmemiş
+  bağımlılıklar, root container, healthcheck yokluğu, login rate-limit,
+  rebuild öncesi otomatik yedek, tek-worker güvencesi, auth test eksikliği.
+- **UI iyileştirmeleri:** marka metni "Stratejik Kokpit" → "Rakip Analizi",
+  measure arama kutusu, mode butonlarının yıl-çeyrek satırına taşınması, koyu
+  mod okunabilirlik bug'ı (aktif sekme beyaz zemin üstünde beyaz yazı
+  görünmez oluyordu).
+
+---
+
+### Dönem 5 — Canlıya alma (2026-08-18 → 19, deploy operasyonu)
+
+*Bu dönem büyük ölçüde git commit'e dökülmedi — operasyonel/altyapı işlemleri.*
+
+- Sunucu hazırlandı; otomatik webhook deploy (push-to-deploy) kuruldu.
+- Kalıcı Docker volume (`/app/data`) + izin (uid 10001) ayarlandı, veri
+  sunucuya taşındı.
+- Domain, DNS ve HTTPS kuruldu.
+- **Kaza (2026-08-19):** Admin panelden hem "Upload" hem "Rebuild" tetiklendi;
+  sunucuda `data/raw/` arşivi henüz taşınmamış olduğundan Rebuild, TÜM geçmişi
+  (51 dönem) silip yerine sadece o an yüklenen 1 dönemi yazdı. **Ders:**
+  production'da normal güncelleme için sadece "Upload" kullanılmalı, "Rebuild"
+  yalnızca tam arşiv sunucudayken güvenli.
+- 2026-06-30 (yeni çeyrek) verisi locale eklendi, 24/27 banka raporlamış
+  durumda (rebuild ile doğrulandı: 160 ölçü, 51 dönem, geçmiş korunmuş).
+  Site tarafının aynı şekilde düzeltilmesi **beklemede** (kullanıcı "daha
+  sonra siteyle ilgileniriz" dedi).
+
+---
+
+### Dönem 6 — Veri taşınabilirliği (2026-08-25)
+
+- **Yeni belirti, aynı kök neden ailesi:** Kullanıcı, GitHub repo'yu indirip
+  **başka (üçüncü) bir sunucuya** taşıdı — proje klasörü olduğu gibi zip'lenip
+  yüklendi (`data/` dahil), sunucuya SSH erişimi yok. Sonuç: kod güncel ama
+  dashboard'da sadece **2025-09** verisi görünüyor, 2025-12 → 2026-06 arası
+  tamamen eksik. Neden: `data/` bilinçli olarak git'te değil (bkz. Dönem 5
+  kazası) — zip'e dahil edilen `data/` kopyası hangi kaynaktan/ne zaman
+  geldiği belirsiz, eski/donmuş bir sürümdü. Kod güncelliği ile veri
+  güncelliği birbirinden bağımsız iki şey, ama bunu ayırt edecek/uyaracak
+  hiçbir mekanizma yoktu — "hangi zip güncel" bilgisi tamamen elle takip
+  ediliyordu.
+- **Bu sunucu için düzeltme yapılamadı** (kullanıcının erişimi yok) — sadece
+  ileriye dönük süreç iyileştirmesi olarak ele alındı.
+- **Çözüm — İKİ tamamlayıcı araç:**
+  1. **`/admin` panelinde "🚚 Sunucu Taşıma" bölümü (önerilen, SSH gerekmez):**
+     `/admin/export-data` + `/admin/import-data` endpoint'leri (`app.py`) +
+     admin.html'de iki buton. Kaynak sunucudan tek tıkla veri ZIP'i indirilir
+     (manifest.json gömülü: ölçü/banka/dönem sayısı, tarih aralığı, git
+     commit), hedef sunucunun admin paneline sürükle-bırakla yüklenir.
+     İçe aktarmadan önce mevcut veri otomatik yedeklenir
+     (`_backup_computed()`), bozuk/boş ZIP reddedilir. `users.json` isteğe
+     bağlı (varsayılan hariç). SSH erişimi olmayan kullanıcı için asıl
+     çözüm bu — tam da bu dönemin başındaki "sunucuya erişimim yok" ihtiyacı
+     için tasarlandı.
+  2. **`scripts/export_data_snapshot.py` (SSH + terminal erişimi olan
+     durumlar için):** `data/computed.json`'dan HER ZAMAN taze bir paket
+     üretir; içine gömülü `MANIFEST.txt` ile içeriği hedefe taşımadan ÖNCE
+     doğrulanabilir kılar. `--include-raw` (tam ham arşiv, tam rebuild
+     kapasitesi için), `--no-users` seçenekleri var.
+- **`docs/DATA_MIGRATION.md` eklendi:** iki yöntemi karşılaştıran bir tablo +
+  her ikisi için adım adım kılavuz + her iki yöntemde de geçerli olan
+  Upload/Rebuild karışıklığı uyarısı (Dönem 5'teki kazaya doğrudan atıf).
+- Test edildi: hem admin panel export→import round-trip'i (gerçek lokal
+  veriyle, curl ve tarayıcıdan, manifest doğru üretiliyor, backup düzgün
+  alınıyor, bozuk ZIP reddediliyor) hem CLI script'i (160 ölçü, 27 banka,
+  son dönem 2026-06-30) çalıştırıldı — regresyon test suite'i (47 test)
+  değişiklik sonrası yeşil.
+- **Admin panele "🗺️ Yol Haritası" sekmesi eklendi.** Yeni
+  `GET /admin/backlog` endpoint'i `docs/BACKLOG.md`'yi ham metin döner,
+  admin.html `marked.js` (CDN) ile render edip gösterir — bu dosya git ile
+  deploy edildiği için (data/'nın aksine) canlıda da her zaman güncel;
+  kullanıcının "backlog dosyasına admin panelinden erişilmesini istiyorum"
+  talebiyle eklendi.
+- **Bug (aynı gün, canlıda bulundu): "Yol Haritası" 404 veriyordu.**
+  `docs/` hem `.dockerignore`'da hariç tutuluyordu hem Dockerfile'da
+  `COPY` edilmiyordu — yani `BACKLOG.md` image'a hiç girmiyordu. `docs/`
+  hariç tutması `data/`'nın gizlilik/boyut mantığıyla karışıp yanlışlıkla
+  genişletilmişti. Düzeltme: `.dockerignore`'dan `docs/` satırı kaldırıldı,
+  `Dockerfile`'a `COPY docs/ docs/` eklendi (~100KB, image'ı şişirmiyor).
+- **"Yenilikler" butonu yapıldı** (yukarıda Bölüm 2, madde 1 — artık kapalı).
+- **Ölü deploy dosyaları kaldırıldı (2026-08-25).** `docker-compose.yml`,
+  `Caddyfile`, `.github/workflows/deploy.yml` — planlanan eski bir "kendi
+  Caddy + GitHub Actions SSH deploy" yaklaşımından kalmıştı, gerçek canlı
+  deploy hiç bunlara dokunmuyordu (deploy kendi webhook + reverse proxy +
+  Dockerfile sürecini kullanıyor). Repo'yu incelerken kafa karıştırdığı fark
+  edilince silindi; `app.py`'deki ilgili güvenlik yorumu (`HOST=0.0.0.0`
+  gerekçesi) güncellendi.
+- **Admin panelde "Yol Haritası" başlıkları accordion'a çevrildi.**
+  Marked.js ile render edilen H2 (Dönem/tier başlıkları) ve H3 (tekil
+  backlog maddeleri) artık DOM'da runtime'da sarmalanıp tıklanınca açılan/
+  kapanan bölümlere dönüştürülüyor (varsayılan hepsi kapalı) — uzun
+  dokümanı taramak kolaylaştı.
+
+---
+
+### Dönem 7 — Dashboard okunurluk ve kullanılabilirlik turu (2026-09-08)
+
+Kullanıcının tek seferde ilettiği 6 maddelik iyileştirme listesi; her biri
+uygulanmadan önce belirsiz noktalar (terim karşılıkları, sıralama referansı,
+seçim hafızasının kapsamı, panel düzeni) kullanıcıya sorulup karara bağlandı.
+
+- **Kompozisyon görünümü okunurluğu.** Geniş ekranda 3 yerine **2 panel yan
+  yana** (grid min genişliği 360 → 520px), bar genişliği **60 → 110px**,
+  bar yüksekliği 240 → 300px, tüm fontlar büyütüldü (segment yüzdesi 10 →
+  12,5px, tarih etiketi 11 → 12,5px, panel başlığı 13 → 16px, lejant 11 →
+  12,5px). Barlar yükseldiği için segment etiketi eşiği %6 → %5'e indi
+  (daha küçük dilimler de yüzdesini gösteriyor).
+- **Türkçeleştirme.** `(agrega)` → **`(grup toplamı)`**, `Measure` →
+  **`Ölçü`**, `Snapshot` → **`Anında Görünüm`**, `Export` → **`Dışa Aktar`**,
+  dışa aktarılan dosya adı `KT_Cockpit_Export_*` → `KT_Rakip_Analizi_*`
+  (eski "Cockpit" markası da temizlendi). **KARAR:** YtD / YoY / QoQ / CAGR
+  / Bps bankacılıkta yerleşik kısaltmalar olduğu için çevrilmedi.
+- **Banka listesi sıralaması (Trend + Kompozisyon).** Kuveyt Türk her zaman
+  başta, gerisi Toplam Aktifler büyüklüğüne göre azalan. **KARAR:** referans
+  dönem sabit — üstteki yıl/çeyrek seçimi değişince chip'lerin yeri
+  oynamasın diye "seçili dönem" değil, her bankanın en son veri verdiği
+  dönem kullanılıyor (son çeyreği raporlamamış banka listenin dibine
+  düşmüyor).
+- **Trend grafiğinde seri adları.** Sol üstte grafiğin içini kapatan lejant
+  kaldırıldı; adlar artık **çizginin bittiği yerde değerin yanında**
+  ("Kuveyt Türk  1,47T"). Aynı hizaya düşen etiketler dikeyde en az 15px
+  ayrıştırılıyor, kaydırılan etiket kendi veri noktasına ince bir bağ
+  çizgisiyle bağlanıyor. Sağ boşluk 80 → 200px.
+- **X ekseni tarih etiketlerinde adaptif seyreltme.** Trend'deki eski kural
+  (her `n/10`'uncu etiket + "sonu her zaman yaz") 16-19 dönemlik
+  aralıklarda çakışma üretiyordu; artık sığan etiket sayısı çizim
+  genişliğinden hesaplanıp etiketler **sondan geriye eşit aralıkla**
+  seçiliyor (en güncel dönem her zaman yazılı). Kompozisyonda bar alanının
+  **gerçek genişliği ölçülüp** aynı mantık uygulanıyor — panel genişliği
+  ekrana/sütun sayısına göre değiştiği için sabit bir kural yeterli
+  olmuyordu. 51 dönem seçiliyken bile çakışma yok (tarayıcıda ölçülerek
+  doğrulandı).
+- **Sekme geçişlerinde seçimler korunuyor.** Trend ve Kompozisyon kendi
+  `useState`'lerini kullandığı için sekme değişince bileşen unmount oluyor
+  ve tüm seçimler (banka/grup, dönem, görünüm modu, yılsonu, alt sekme)
+  varsayılana dönüyordu; state `App`'e taşındı. **KARAR:** iki sekme
+  seçimini **ayrı** tutuyor, biri diğerini etkilemiyor.
+
+Doğrulama: tarayıcıda uçtan uca test edildi — chip sırası, etiket çakışması
+(trend ve kompozisyonda 0), sekme geçişinde state korunması, koyu mod
+okunabilirliği, konsol hatası yok; 47 test yeşil.
+
+**Aynı gün, ikinci tur (renk paleti + hover + eksen):**
+
+- **Banka renkleri marka/logo paletlerine göre yeniden kuruldu.** Her banka
+  kendi renk ailesinde kalıyor (yeşil / mavi / kırmızı / mor / turuncu),
+  aynı ailedeki bankalar **parlaklık kademeleriyle** ayrılıyor — ton marka
+  kimliğini taşıdığı için korunuyor. Repoda logosu bulunan 4 banka (KT, TEB,
+  Vakıf Katılım, Ziraat Katılım) için renk doğrudan logo SVG'sinden alındı;
+  kalan 23 banka için bilinen kurumsal renkler kullanıldı (kullanıcı kararı:
+  "bildiğin marka renklerini kullan, sonra onaya sun" — palet görsel olarak
+  onaya sunuldu). **Kuveyt Türk `#62AE41` olarak SABİTLENDİ**, kullanıcı
+  belirledi, değiştirilmemeli.
+  **Doğrulama:** CIELAB uzayında 27 rengin birbirine en yakın çifti
+  **ΔE 15,4** (ayırt edilebilirlik eşiği ~15) — "aynı renkte iki banka"
+  kalmadı. Palet üretimi/doğrulaması betikle yapıldı, elle göz kararı değil.
+- **Paletin iki yan etkisi düzeltildi:** (1) yeni palette hem çok koyu
+  (`#0B2E63`) hem çok açık (`#FFB600`) tonlar var; seçili chip'lerdeki sabit
+  beyaz yazı açık zeminlerde okunmuyordu → `contrastTextOn()` eklendi (beyaz
+  ve koyu adaydan WCAG kontrast oranı yüksek olanı seçer), 27 chip'in tamamı
+  artık ≥ 4,5:1. (2) Trend çizgi/noktaları koyu modda kaybolmasın diye
+  `darkSafeColor` tonuna geçti — açık modda marka renginin birebir kendisi.
+- **Kompozisyonda hover ile tam yüzde.** Bar sütununa gelince o dönemin
+  **tüm bileşenleri** tam hassasiyetle (2 ondalık) ve TL karşılığıyla
+  listeleniyor, imlecin üzerindeki segment vurgulanıyor. Eskiden yalnızca
+  geç açılan, stilsiz native `title` vardı ve %5'in altındaki segmentlerin
+  yüzdesi hiçbir yerde görünmüyordu.
+- **Y ekseni sıfır tabanı.** Tüm değerler pozitifken eksen artık negatife
+  inmiyor. Alt pay (%8-10) dar aralıklı serilerde tabanı sıfırın altına
+  itiyordu; "eksi büyüklük" diye bir şey olmadığı için yanıltıcıydı.
+  **KARAR:** taban 0'a *kırpılıyor* (her zaman 0'dan başlamıyor) — böylece
+  dar bantlı rasyolarda trend farkı ezilmiyor. Gerçekten negatif veri varsa
+  (QoQ/YoY düşüşleri) eksen yine eksiye iniyor. Hem ana trend hem snapshot
+  mini trendinde uygulandı.
+
+---
+
+### Dönem 8 — 2026Q2 tamamlandı + kritik pipeline bug'ı (2026-09-08)
+
+- **Kullanıcı "BDR Veriler" klasörünü yükledi:** 27 banka × 30.06.2026, düz
+  klasör, dosya adları pipeline formatına (`<Banka> - GG.AA.YYYY.xlsx`)
+  birebir uygun. Yüklemeden önce içerik doğrulaması yapıldı: dosyalar
+  mevcutlardan ~%25 küçüktü (geçmişte "eklentisiz export → bozuk veri"
+  belirtisi buydu), ama satır/tablo/kalem sayıları ve Toplam Aktifler
+  değerleri **birebir aynı** çıktı — fark yalnızca hücre formatlaması.
+  24 bankanın verisi değişmiyor, **3 banka için 2026Q2 ilk kez geliyordu**
+  (Dünya Katılım, Hayat Finans, TOM Bank).
+- **KRİTİK BUG — yeni çeyrek hesaplanmıyordu (`pipeline/compute.py`).**
+  27 dosya sorunsuz yüklenip parquet'e işlendiği hâlde 3 bankanın verisi
+  dashboard'a yansımadı; coverage 24/27'de kaldı. Kök neden: `compute_all`,
+  bir banka için hesaplanacak tarihleri **yalnızca baseline'dan** (mevcut
+  `computed.json`) alıyordu; ham veri (parquet) tarihlerine ancak baseline
+  o banka için TAMAMEN boşsa düşüyordu. Yani mevcut bir bankaya **yeni bir
+  çeyrek** eklendiğinde o tarih baseline'da olmadığı için hiçbir measure
+  hesaplanmıyordu. Upload akışı baseline ile çağırdığından bu yol **her
+  yeni çeyrekte** tetikleniyordu — yani canlıda da her yeni dönem
+  yüklemesinde aynı sorun yaşanacaktı.
+  **Düzeltme:** tarih kümesi artık `baseline ∪ ham veri`. Baseline'da olup
+  raw'da olmayan tarihler (passthrough geçmişi) korunur, raw'a yeni gelen
+  dönemler hesaplanır.
+- **Sonuç:** 2026-06-30 raporlayan banka **24/27 → 27/27**, coverage'da
+  "eksik banka: YOK". Eksik üyeler tamamlanınca 2026Q2 için hesaplanamayan
+  grup toplamları da geldi: **Katılım Bankaları "—" → 4.903.083 mn TL**,
+  **KT Hariç Katılım "—" → 3.430.769 mn TL** (dashboard'da YtD %13,50 ve
+  %15,59). Geçmiş bozulmadı: 1157 banka×dönem karşılaştırmasında **0
+  değişiklik**; 51 dönem, 160 ölçü, kompozisyon/döviz payload'ları yerinde.
+  47 test yeşil.
+- İşlem öncesi `computed.json` + `veriler.parquet` elle yedeklendi
+  (`data/backups/manuel_<zaman>/`); yükleme production'daki gerçek
+  `/admin/upload` akışıyla yapıldı (kalite kontrolü, otomatik yedek,
+  rollback ve kompozisyon üretimi bu akışın içinde).
+- `BDR Veriler/` `.gitignore`'a eklendi — ham veri git'e girmez (`data/`
+  ile aynı ilke).
+- **computed.json sağlamlaştırıldı (aynı gün).** Mevcut korumalar yetersizdi:
+  `_assert_nonempty_result` yalnızca sonucun TAMAMEN boş olmasını yakalıyordu,
+  bu yüzden 2026-08-19'daki "51 dönem → 1 dönem" kazası kilidi geçmişti.
+  İki katman eklendi (kullanıcı seçimi):
+  1. **Regresyon kilidi.** Yazımdan önce yeni sonuç mevcut `computed.json` ile
+     kıyaslanır; ölçü/banka/dönem sayısı düşerse ya da dolu hücre sayısı %2'den
+     fazla azalırsa yazma **409 ile reddedilir**, mevcut veri korunur ve neyin
+     ne kadar düştüğü raporlanır. Üç yazma akışında da devrede (upload,
+     upload-zip, rebuild). **KARAR:** meşru küçülmeler için kaçış kapısı var —
+     admin panelde "Veri azalmasına izin ver" onay kutusu.
+  2. **Bozukluk kurtarma.** Açılışta `computed.json` okunamıyor/şeması bozuksa
+     (yarım yazım, disk dolması) uygulama çökmek yerine `data/backups/`
+     içindeki en yeni **sağlam** yedeğe döner; bozuk dosya
+     `computed.corrupt_<zaman>.json` olarak saklanır ve admin panelde ne
+     olduğunu anlatan bir uyarı gösterilir.
+  **19 yeni test** eklendi (`tests/test_computed_guards.py`) — 2026-08-19
+  kazasının birebir senaryosu dahil. Toplam 66 test yeşil.
+
+### Dönem 9 — Gayrinakdi Krediler raw'a taşındı (2026-09-09)
+
+- **Tetikleyici:** kullanıcı, 2026Q2'de "Gayrinakdi Krediler (Garanti ve
+  Kefaletler)" ölçüsünün boş göründüğünü bildirdi. Kök neden: bu ölçü
+  `BASELINE_PASSTHROUGH`'daydı (13 kalemden biri) — yani v29 PBI baseline
+  JSON'undan olduğu gibi kopyalanıyordu ve baseline yalnızca 2026-03-31'e
+  kadar gidiyordu. Yeni bir çeyrek geldiğinde passthrough kalemler ASLA
+  otomatik dolmaz (bkz. Dönem 8, aynı ailenin farklı bir belirtisi).
+- **Analiz:** ham veride (`Bilanço Dışı Yükümlülükler` tablosu, kalem
+  `'Garanti Ve Kefaletler, Toplam'`) bu ölçünün v29 baseline'la ne kadar
+  örtüştüğü ölçüldü — 1057 tarihsel (banka, tarih) noktasından **1053'ü
+  birebir eşleşti**. Kalan 4'ü: ikisi ~2015-2019 arası ihmal edilebilir
+  küçük bankalarda (milyon TL seviyesinde yuvarlama farkı) ve **KT
+  2020-06-30'da kaynak verinin kendisinde bir bozukluk** (`Toplam` satırı
+  -2,15 trilyon TL — fiziksel olarak imkânsız bir negatif değer; alt
+  kalemlerin toplamı ise doğru baseline değeriyle (~12,12 milyar TL)
+  eşleşiyordu).
+- **Düzeltme (`pipeline/measures.py`):** `m_gayrinakdi_krediler` artık
+  `ctx.bd(b, t, 'Garanti Ve Kefaletler, Toplam')`'ı doğrudan kullanıyor;
+  yalnızca değer **negatifse** (anlamsız/bozuk veri sinyali) 9 alt kalemin
+  toplamına düşüyor (`_GAYRINAKDI_LEAF_KALEMLER`). Ölçü `MEASURE_FUNCS`'a
+  eklendi, `BASELINE_PASSTHROUGH`'dan çıkarıldı (artık 13 → 12 kalem).
+  4 yeni birim test (`tests/test_gayrinakdi_krediler.py`, gerçek veriden
+  bağımsız, KT 2020-06-30 kazasının senaryosu dahil).
+- **Sonuç:** `/admin/rebuild` yerel ortamda çalıştırıldı (production'ın
+  kullandığı BİREBİR aynı kod yolu). Regresyon kilidi geçti (dolu hücre
+  183.656 → 183.783, **kayıp yok**). 27 bankanın 27'si için 2026-06-30
+  artık dolu; KT 2020-06-30'daki tarihsel bozukluk da yan etki olarak
+  düzeltildi. Toplam 70 test yeşil.
+- **Anlam:** bu, "13 passthrough ölçüyü ham veriden hesapla" kararının
+  (bkz. §8 FAZ yol haritası, henüz genel olarak ertelenmişti) tek bir
+  kalem için, kullanıcının somut talebiyle, önceden yapılmış hâli — geri
+  kalan 12 kalem hâlâ bilinçli olarak passthrough (bkz. §9 kararlar
+  günlüğü).
+- **AÇIK KALAN İŞ — canlı sunucuya yansıtma (GÜNCELLEME: `/admin/rebuild`
+  GEREKMEDİ).** İlk düşünce `/admin/rebuild`'di ama bu, production'da
+  `data/raw/` tam değilken geçmişi silme riski taşıyordu (Dönem 5 kazası).
+  Bunun yerine yerelde (düzeltmeyi içeren, zaten yeniden hesaplanmış)
+  `computed.json` `/admin/export-data`'dan (CLI script'ten DEĞİL — o
+  `MANIFEST.txt` üretiyor, panel `manifest.json` bekliyor; bu karışıklık
+  bir kez yaşandı) paketlendi; kullanıcıya panelden **İçe Aktar** ile
+  yüklemesi için teslim edildi (import henüz teyit edilmedi — bkz. §7).
+  Rebuild'e hiç gerek kalmadı — hem staleness hem bu düzeltme tek pakette.
+
+### Dönem 10 — Admin üye şifresi sıfırlama (2026-09-09)
+
+- **Tetikleyici:** kullanıcı, bir üyenin (Berkan Keskin) şifresini
+  unuttuğunu bildirip nasıl sıfırlayacağını sordu. Kod taraması: admin
+  panelinde onayla/reddet/rol dışında bir üye-yönetim aracı yoktu — şifre
+  sıfırlama **hiç yoktu**, tekrar kayıt da email zaten kayıtlıyken
+  engelleniyordu (`create_signup`, durumdan bağımsız). Gerçek bir özellik
+  boşluğuydu.
+- **Eklenen:** `users.py::admin_reset_password()` — `change_password`'dan
+  farkı, mevcut şifre doğrulanmıyor (admin zaten yetkili). `app.py`'de
+  `POST /api/admin/users/{id}/reset-password`, mevcut approve/reject/role
+  endpoint'leriyle **aynı** yetki deseni (`require_admin_access` +
+  `_assert_can_target_user` — sıradan admin ultra'yı hedefleyemez).
+  `@admin.local` hesapları (start.sh → KT_PASSWORD'den senkron) hem
+  backend'de hem UI'da hariç tutuldu — onlarda buton hiç görünmüyor.
+  `frontend/admin.html`'de "🔑 Şifre Sıfırla" butonu, sadece onaylı +
+  env-senkron olmayan üyelerde.
+- **Doğrulama:** 3 yeni test (kısa şifre reddi, olmayan kullanıcı,
+  başarılı sıfırlama + eski şifreyle giriş engeli) + curl ile uçtan uca +
+  tarayıcıda buton görünürlüğü (test1'de var, admin.local hesaplarında
+  yok). Toplam 73 test yeşil.
+
+### Dönem 11 — Admin panelinden doğrudan üye ekleme (2026-09-09)
+
+- **Tetikleyici:** canlı site için yeni bir üyelik açılması
+  gerekti. İlk düşünce (herkese açık `/signup` formunu bizzat doldurmak)
+  reddedildi — hesap açma/kimlik girme, operatör politikası gereği asla
+  otomatik yapılmaz. Kullanıcı bunun yerine gerçek bir **admin-panel
+  özelliği** istedi: admin, signup + onay adımlarını atlayıp doğrudan
+  onaylı bir hesap açabilsin.
+- **Eklenen:** `users.py::admin_create_user()` — `create_signup` ile aynı
+  doğrulamaları (domain kısıtı `ALLOWED_SIGNUP_DOMAINS`, min 8 karakter
+  şifre, mükerrer email — signup'la **aynı email havuzunu** paylaşır)
+  uygular, ama `status='approved'` olarak, `approved_by`/`approved_at`
+  dolu şekilde kaydeder — bekleme yok. `app.py`'de
+  `POST /api/admin/users` (`require_admin_access` arkasında).
+  `frontend/admin.html`'de "➕ Üye Ekle (doğrudan onaylı)" formu, Üyelik
+  Başvuruları sekmesinin üstünde (Ad Soyad / e-posta / şifre alanları).
+- **Doğrulama:** 5 yeni test (doğrudan onaylı ekleme + hemen giriş,
+  domain kısıtı, şifre uzunluğu, mükerrer email, signup'la ortak email
+  havuzu) — toplam 78 test yeşil. Ayrıca yerel sunucuda tarayıcıdan uçtan
+  uca doğrulandı: form dolduruldu → "✓ Üye eklendi ve onaylandı" →
+  listede yeni üye onaylı/üye rolüyle göründü → test kaydı doğrulama
+  sonrası temizlendi (gerçek veriye karışmadı).
+- **Not:** Bu özellik, aynı gün içindeki yerel `data/` klasörü veri kaybı
+  olayının (bkz. §7) hemen öncesinde tamamlanmıştı; olay nedeniyle
+  doğrulama/dokümantasyon/commit adımları bu döneme ertelendi.
+
+### Dönem 12 — Mobil duyarlı tasarım (2026-09-09)
+
+- **Tetikleyici:** kullanıcı dashboard'un ve admin panelinin tüm mobil
+  cihazlarda (görüntü ve fonksiyon bozulmadan, tüm açılan pencereler
+  dahil) düzgün çalışmasını istedi.
+- **Kök neden:** `index_v30.html`'de `.dashboard-grid`
+  (`minmax(460px,...) minmax(560px,...)`), `.comp-grid`
+  (`minmax(520px,1fr)` × N) ve `.export-grid` (`380px 1fr`) sabit piksel
+  alt sınırları, dar ekranlarda tüm sayfanın layout viewport'unu
+  ~1000px'e zorluyordu — mobil tarayıcı bunu telafi etmek için metni
+  dengesiz büyütüyordu (`text-size-adjust`), üstteki toolbar butonları
+  başlığın üzerine biniyordu. `admin.html`'de ise header (flex,
+  wrap yok) ve filtre/tablo alanları (sarmalayıcısız) aynı sınıf soruna
+  sahipti.
+- **İkinci kat sorun (CSS Grid min-content tuzağı):** grid'leri tek
+  sütuna indirmek yetmedi — grid item'ların varsayılan
+  `min-width:auto`'su, içindeki nested grid'lerin (ör. banka sıralama
+  tablosunun JS'ten inline set edilen `110px 1fr 82px` sütunları) asıl
+  içerik genişliğini yukarı taşıyıp paneli gizlice şişiriyordu (görünüşte
+  sığıyor ama sağ sütun kırpılıyordu). Çözüm: hem grid item'a
+  (`min-width:0`) hem grid track'ine (`1fr` → `minmax(0,1fr)`) birlikte
+  müdahale gerekti — ikisi de tek başına yeterli değildi.
+- **Yapılan:** `index_v30.html` ve `admin.html`'e `text-size-adjust:100%`
+  + `overflow-x:hidden` (global koruma), 900px/560px kademeli
+  `@media` blokları: dashboard/comp/export grid'leri tek sütun,
+  topbar/control-bar/header wrap, banka sıralama tablosu daraltılmış
+  sütunlar, 20 bankalık YtD değer satırı (üst üste biniyordu, alttaki
+  tablo zaten tam değeri gösteriyor) mobilde gizlendi, dönem karşılaştırma
+  popover'ı mobilde alttan açılan sabit panele döndü (tetikleyici konumundan
+  bağımsız taşma riski ortadan kalktı). `admin.html`'de ayrıca sarmalayıcısız
+  üye tablosu/filtre satırı da body'nin yeni `overflow-x:hidden`'ı yüzünden
+  sessizce kırpılıyordu — `overflow-x:auto` sarmalayıcı eklendi.
+  `login.html`/`signup.html` zaten sorunsuzdu, değişiklik gerekmedi.
+- **Doğrulama:** JS tabanlı otomatik taşma taraması (`getBoundingClientRect`
+  ile viewport'u aşan her element) 375px (mobil), 560px, 768px (tablet) ve
+  1400px (masaüstü) genişliklerde — dashboard'un 4 sekmesi (Anında Görünüm,
+  Trend, Kompozisyon, Dışa Aktar), tüm modaller (yıl seçici, ölçü arama,
+  şifre değiştir, yenilikler) ve admin panelinin 5 sekmesi (Üye Ekle formu
+  dahil) için 0 taşan element. Masaüstü (1400px) ekran görüntüsüyle
+  regresyon yok doğrulandı — grid'ler, orta logo, tek satır toolbar
+  korunmuş. 78 test yeşil (frontend-only değişiklik, backend etkilenmedi).
+
+### Dönem 13 — Panel hizalama, KT marka rengi, premium kart tasarımı (2026-09-10)
+
+- **Tetikleyici:** kullanıcı üç şey istedi: (1) "İlk 20 Banka Büyüklükleri"
+  (sol) ile "İlk 20 Banka YtD Büyüme" (sağ üst) panellerinin alt kenarları
+  eşit seviyede değildi, eşitlenmesi; (2) tüm panel/kart tasarımının daha
+  premium hale getirilmesi — **önce sorularak** (yön onaylandıktan sonra
+  uygulanacak); (3) topbar'daki yeşil tonun KT kurumsal rengiyle
+  (`#62AE41`) değiştirilmesi.
+- **Panel hizalama — kök neden:** sol sütun (`BankRanking`) tek uzun bir
+  panel (20 satır), sağ sütun ise `YtDGrowthChart` + `GroupSummary` +
+  `CompetitorCardsGrowth`'un alt alta dizilmiş 3 ayrı paneli — doğal
+  olarak YtD grafiği tek başına çok daha kısa kalıyordu.
+- **Çözüm:** `SnapshotView`'da sol panelin gerçek yüksekliği `useRef` +
+  `getBoundingClientRect` ile ölçülüp (`ResizeObserver` yerine mevcut
+  kod tabanındaki `barsW` deseniyle tutarlı, `window resize` dinleyicili
+  bir `useEffect`) `YtDGrowthChart`'a `matchHeight` prop'u olarak
+  aktarılıyor; grafik paneli CSS flex ile bu yüksekliğe geriliyor,
+  `ytd-bars-area`'nın GERÇEK render yüksekliği de ayrıca ölçülüp barların
+  oranı ona göre hesaplanıyor (0 vs 130px fallback → artık dinamik).
+  Yalnız masaüstünde (>900px) aktif — mobilde grid tek sütuna indiği için
+  eşleme anlamsız, `matchHeight=0` ile devre dışı.
+- **Kritik bug ve düzeltmesi — CSS Grid `align-items:stretch` döngüsü:**
+  ilk denemede yükseklik saniyeler içinde milyonlarca piksele patladı.
+  Kök neden: `.dashboard-grid`'in varsayılan `align-items:stretch`'i sol
+  paneli (BankRanking) zaten sağ sütunun toplam yüksekliğine göre
+  esnetiyordu; sağ paneli SOL panelin ÖLÇÜLEN (zaten esnetilmiş, gerçek
+  olmayan) yüksekliğine göre büyütmek bu iki değeri birbirini besleyen
+  sonsuz bir döngüye soktu. Düzeltme: `.ranking-panel { align-self: start }`
+  — sol panel artık grid'in esnetmesinden muaf, yalnızca kendi içeriğine
+  göre boyutlanıyor, döngü kırıldı. **Ders:** dinamik yükseklik eşleme
+  eklerken kaynak elemanın PASİF (grid/flex tarafından etkilenmeyen) bir
+  ölçüm noktası olduğundan emin olunmalı.
+- **KT marka rengi:** `--kt-green: #016B4E` → `#62AE41`,
+  `--kt-green-dark: #014a37` → `#457A2E` (0,7 oranında koyulaştırılmış
+  eşlenik). 4 dosyada (`index_v30.html`, `admin.html`, `login.html`,
+  `signup.html`) tek `:root` tanımından geliyordu — hepsi tutarlı şekilde
+  güncellendi. Çizelgelerdeki "bu Kuveyt Türk" vurgu rengi (`#559D87`,
+  farklı, veri-görselleştirme amaçlı bir ton) kasıtlı olarak
+  **dokunulmadı** — talep yalnızca marka/topbar rengiyle ilgiliydi.
+- **Premium tasarım — "zarif & minimal" (kullanıcı seçimi, 4 seçenekten):**
+  `AskUserQuestion` ile yön ve renk kaynağı önceden soruldu. Uygulanan:
+  `.panel`/`.comp-panel`/`.group-cell`/`.competitor-card` sert
+  `#d4dde3` kenarlıkları → `rgba(15,31,47,0.06-0.07)` ince kenarlık +
+  çok katmanlı yumuşak `box-shadow`; `border-radius` 4-8px → 8-12px;
+  `.panel-header`/`.bank-ranking-header`/`.rank-badge-row`'un düz gri
+  (`#eef2f5`) zemini → neredeyse beyaz (`#fafbfc`) + ince alt çizgi.
+  `.group-cell.kt`'nin kalın 2px kenarlığı → ince kenarlık + soluk tonlu
+  zemin + hafif halka gölgesi (marka rengiyle DEĞİL, mevcut `#559D87`
+  vurgu tonuyla — tutarlılık için). Koyu mod eşdeğerleri ayrı ayrı
+  ayarlandı (`rgba(255,255,255,0.02-0.07)` zemin/kenarlık,
+  `rgba(0,0,0,0.25-0.35)` gölge).
+- **Doğrulama:** panel yükseklikleri JS ile ölçülüp birebir eşit
+  olduğu teyit edildi (576,28px = 576,28px), rasyo modu (GroupSummary'nin
+  aynı slotu kullandığı durum) etkilenmediği ekran görüntüsüyle
+  doğrulandı, koyu mod ve Kompozisyon sekmesi görsel kontrol edildi,
+  mobilde (375px) 0 taşan element, admin/login/signup'ta yeni renk görsel
+  doğrulandı. 78 test yeşil (frontend-only).
+
+### Dönem 14 — Banka sıralama tablosu başlığı sadeleştirildi (2026-09-10)
+
+- **Tetikleyici:** kullanıcı bir önceki dönemin hizalama düzeltmesinden
+  sonra tabloya baktı, ekran görüntüsü gönderdi: "Değer" başlığı gereksiz
+  (bar zaten değeri temsil ediyor), "İlk 20 Banka Büyüklükleri" etiketi
+  bar sütununun sonuna kadar uzamalı, "Pazar Payı Değişimi" kendi
+  sütununda net durmalı.
+- **Yapılan:** `BankRanking`'in başlık satırı artık gövde satırlarından
+  (`.bank-row`, hâlâ 3 sütun: isim/bar/delta) FARKLI bir grid kullanıyor
+  — `headerGridCols` (`1fr 82px`, delta yoksa `1fr`) — "Değer" hücresi
+  tamamen kaldırıldı, kalan tek geniş başlık hücresi sola hizalandı ve
+  isim+bar bölgesinin tamamını kaplıyor. Rasyo modunda da aynı düzen
+  (sadece etiket metni değişiyor: "İlk N Banka Rasyo (...)").
+- **Unutulan detay:** mobil breakpoint'lerdeki (900px/560px)
+  `.bank-ranking-header, .bank-row { grid-template-columns: ... !important }`
+  kuralı İKİSİNE birden aynı 3-sütunlu şablonu `!important` ile
+  dayatıyordu — header artık 2 sütun olduğu için bu, mobilde eski 3
+  sütunlu boşluğu geri getirirdi. İki selector ayrıştırıldı: `.bank-row`
+  3 sütunda kaldı, `.bank-ranking-header` kendi 2-sütunlu (`minmax(0,1fr) 82px`
+  / mobilde `64px`) kuralını aldı.
+- **Doğrulama:** masaüstü (1400px) ve mobil (375px) ekran görüntüsüyle
+  hem büyüklük hem rasyo modu kontrol edildi, mobilde 0 taşan element,
+  78 test yeşil.
+
+### Dönem 15 — Banka sıralama barları "ekonbulten.html" tarzında (2026-09-10)
+
+- **Tetikleyici:** kullanıcı "İlk 20 Banka Büyüklükleri" başlığının
+  ortalanmasını ve satırların daha görünebilir/ferah bir formata
+  getirilmesini istedi; grafiklerin projeye yüklediği
+  `ekonbulten.html` (Ekonomi Bülteni — ayrı bir proje, referans için
+  bu projenin köküne kopyalanmış) dosyasındaki bar grafik diline
+  benzemesini istedi.
+- **Referans incelemesi:** `ekonbulten.html` bir "bundler" sarmalayıcısı
+  (self-contained data: URL'e açılan bir bundle) — tarayıcıda açılıp
+  gezilerek incelendi. "04 · Piyasalar → Reel Getiri" sekmesindeki
+  yatay bar grafiği ("Temmuz 2026 Aylık Reel Getiriler") en yakın
+  görsel analog: yuvarlak uçlu barlar, değerin bar'ın hemen bitişinde
+  ama kendi nefes payında ayrı bir etiket olarak durması, ferah satır
+  aralığı.
+- **Yapılan (`BankRanking`, `.bank-row`/`.bank-bar-cell`/`.bank-value`):**
+  `.bank-row` satır yüksekliği 20px → 29px; bar yüksekliği 13px → 16px;
+  bar sağ ucu `border-radius: 0 7px 7px 0` (belirgin yuvarlak uç,
+  eskiden 0 2px 2px 0); değer sütunu 60px → 66px, bar–değer arası
+  boşluk 4px → 7px, değer fontu 10.5px → 11px ve `font-weight: 700`
+  (daha okunur/belirgin). Başlık hücresinin bir önceki dönemde sola
+  yaslanan (`textAlign:'left'`) hali, sağ paneldeki ("İlk 20 Banka YtD
+  Büyüme") ortalanmış başlıkla tutarlı olsun diye tekrar ortaya
+  alındı (inline override kaldırıldı, `.bank-ranking-header > div`'in
+  varsayılan `text-align:center`'ı geçerli).
+- **Not — yükseklik eşleme etkisi:** satırlar uzayınca ranking-panel'in
+  doğal yüksekliği ~576px → ~682px'e çıktı; Dönem 13'teki `matchHeight`
+  mekanizması sayesinde YtD grafiği de otomatik olarak aynı yüksekliğe
+  büyüdü (barlar daha da belirgin göründü) — panel hizalaması
+  bozulmadı, ekstra müdahale gerekmedi.
+- **Doğrulama:** masaüstünde (1400px) `rankingHeight === ytdPanelHeight`
+  (682,375px = 682,375px) JS ile teyit edildi, mobilde (375px) 0 taşan
+  element, ekran görüntüsüyle hem büyüklük hem mobil görünüm kontrol
+  edildi. 78 test yeşil.
+
+### Dönem 16 — Başlık gri alanları eşitlendi, YtD grafiği küçültüldü (2026-09-10)
+
+- **Tetikleyici:** kullanıcı, "İlk 20 Banka Büyüklükleri" başlığının gri
+  alanının "İlk 20 Banka YtD Büyüme" başlığıyla aynı yükseklikte
+  olmadığını fark etti — panel gövdeleri hizalı olsa da (Dönem 13)
+  başlıklar değildi. Ayrıca Dönem 15'te satırlar uzayınca YtD grafiğinin
+  barları da orantılı büyümüştü; kullanıcı barların biraz küçültülüp
+  banka isim etiketlerinin daha net okunmasını istedi.
+- **Kök neden — başlık uyumsuzluğu:** sol başlıkta "Pazar Payı Değişimi
+  (Bps)" dar (82px) bir sütunda 2 satıra sarıyor, sağ başlıktaki tek
+  satırlık "İlk 20 Banka YtD Büyüme (%)" ise sarmıyor — doğal yükseklik
+  farkı (54,4px vs 43,2px) oluşuyordu.
+  Çözüm: `SnapshotView`'daki mevcut yükseklik-ölçüm deseni (Dönem 13)
+  genişletildi — artık `bank-ranking-header`'ın kendi yüksekliği de ayrı
+  bir `ref` ile ölçülüp `headerMatchHeight` olarak `YtDGrowthChart`'a
+  aktarılıyor; o da kendi `panel-header`'ına bu değeri `min-height` +
+  dikey ortalama (`display:flex;align-items:center`) olarak uyguluyor.
+  Panel gövde hizalaması (matchHeight) ayrı bir mekanizma olduğu için
+  etkilenmedi — ikisi paralel çalışıyor.
+- **YtD barlarını küçültme:** `.ytd-chart-container`'ın `flex:1`
+  (panelin tüm yüksekliğini dolduran) davranışı `flex:0 1 auto` +
+  `max-height:300px` (min 230px) ile sınırlandı; `.ytd-panel-body`'ye
+  `justify-content:center` eklendi — grafik artık uzun panelin İÇİNDE
+  ortalanmış, daha kompakt bir blok (gerçek yükseklik ~234px, önceki
+  ~500px+'den belirgin küçük). Banka etiket satırı (`.ytd-labels-row`)
+  70px → 80px, yazı boyutu 10px → 11px büyütülerek okunabilirlik ayrıca
+  artırıldı.
+- **Doğrulama:** masaüstünde JS ile `leftHeaderHeight === rightHeaderHeight`
+  (54,375px = 54,375px) VE `rankingHeight === ytdPanelHeight` (682,375px
+  = 682,375px) aynı anda teyit edildi — hem başlıklar hem panel tabanları
+  hizalı. `barsAreaHeight` 130px'e (min fallback'e yakın) düştüğü ölçüldü.
+  Rasyo modu ve mobil (375px, 0 taşan element) ekran görüntüsüyle kontrol
+  edildi. 78 test yeşil.
+
+### Dönem 17 — Trend grafikleri "diğerleri gibi" premium (2026-09-10)
+
+- **Tetikleyici:** kullanıcı, Trend sekmesindeki çizgi grafiklerinin de
+  Dönem 13-16'da diğer panellere uygulanan premium tasarımla tutarlı
+  görünmesini istedi.
+- **Kart konteynerleri:** `.trend-controls` ve `.trend-chart-wrap`
+  (eskiden düz `#d4dde3` kenarlık, `border-radius:6px`, gölgesiz) diğer
+  panellerle aynı reçeteye getirildi — `rgba(15,31,47,0.06)` ince
+  kenarlık, `border-radius:12px`, çok katmanlı yumuşak `box-shadow`
+  (+ koyu mod eşdeğeri).
+  Bu iki class daha önceki premium geçişte (Dönem 13) atlanmıştı.
+- **Grafik çizim dili — `smoothPathFromPoints()` (yeni yardımcı
+  fonksiyon, Catmull-Rom → kübik Bezier, gerilim 1/6):** düz
+  `M...L...L...` çoklu-çizgi yerine artık yumuşak eğri kullanılıyor —
+  boşluklu (null) veri noktaları eskisi gibi atlanıp aradaki geçerli
+  noktalar birbirine bağlanıyor, davranış aynı kalıyor.
+- **Gradyan alan dolgusu:** yalnızca TEK seri seçiliyken (`series.length
+  === 1`) çizginin altına yarı saydam gradyan dolgu ekleniyor — birden
+  fazla seri üst üste binince dolgu karmaşıklaşacağı için çoklu seride
+  atlanıyor (yalnızca eğri + nokta stilini paylaşıyorlar).
+  `smoothAreaPath()` eğri çizgisini alt eksene kadar kapatıyor.
+  `<defs><linearGradient>` seri rengiyle (`series[0].textColor`)
+  eşleşiyor, %22 → %0 opaklık.
+- **Nokta ve çizgi stili:** çizgi kalınlığı 2,2 → 2,5px,
+  `strokeLinecap`/`strokeLinejoin: round` eklendi (yumuşak uçlar);
+  noktalar r=3 → 3,5, artık beyaz halka (`stroke:#fff`) ile — koyu
+  zeminde de çizgiden ayrışıyor. Gridline'lar daha soluk
+  (`rgba(15,31,47,0.07)`, dash kaldırıldı — solid) — referans
+  grafiklerdeki temiz görünüme daha yakın.
+- **Çizgi sonu etiketleri — rozet (pill):** eskiden düz renkli metin
+  olan uç etiketleri artık yuvarlak köşeli (`rx:6`), beyaz (%94 opak)
+  zeminli, seri rengiyle ince kenarlıklı bir rozet arka planına sahip —
+  ekonbulten.html referansındaki değer etiketi stiline birebir benziyor.
+  Genişlik `label.length × 6,4 + 16` ile kabaca tahmin ediliyor (SVG'de
+  gerçek metin genişliği DOM ölçümü gerektirdiği için). Rozetler artık
+  19px yüksekliğinde olduğundan, dikey çakışma-önleme eşiği de 15px →
+  20px'e çıkarıldı.
+- **Doğrulama:** tek seri (gradyan dolgulu), 4 serili çoklu görünüm
+  (dolgusuz, rozetler çakışmadan ayrışmış), YtD büyüme modu (0 referans
+  çizgili), koyu mod — hepsi ekran görüntüsüyle kontrol edildi. Mobilde
+  (375px) SVG 293px genişliğe doğru küçüldü, 0 taşan element. 78 test
+  yeşil (frontend-only).
+
+### Dönem 18 — Başlık boyutu eşitlendi, YtD kartı zorla-hizalamadan kurtuldu (2026-09-10)
+
+- **Tetikleyici:** kullanıcı iki şey istedi: (1) "İlk 20 Banka
+  Büyüklükleri" başlığının yazı boyutu "İlk 20 Banka YtD Büyüme"
+  kadar büyük olsun VE tam ortalansın (yatay + dikey); (2) Dönem 13/16'da
+  eklenen "YtD kartını sol tabloyla aynı yüksekliğe zorla" mekanizması
+  kaldırılsın — bunun yerine sağdaki 3 kart (YtD/Grup, Grup, Rakip
+  Kartları) kendi doğal boyutunda kalıp, ARALARINDAKİ boşluk esneyerek
+  yığının toplamı sol panelle aynı yerde bitsin.
+- **Başlık boyutu/ortalama:** `.bank-ranking-header > div`'in
+  `font-size:10,5px → 13px`, `font-weight:600 → 700`,
+  `color:#334155 → #1a2635` — artık `.panel-header` ile birebir aynı
+  tipografi. `.bank-ranking-header`'a `align-items:center` eklendi —
+  "Pazar Payı Değişimi (Bps)" dar sütunda 2-3 satıra sardığı için
+  satırın doğal yüksekliği "İlk 20 Banka Büyüklükleri" hücresinden
+  fazla oluyor; artık o kısa metin bu taşan yükseklik içinde dikey
+  ortalanıyor (üstten/alttan eşit boşluk).
+- **Zorla-hizalamadan esnek hizalamaya geçiş:** Dönem 13/16'daki
+  `matchHeight`/`headerMatchHeight` mekanizması YtDGrowthChart'tan
+  tamamen kaldırıldı (kart artık her zaman doğal/kompakt boyutunda —
+  Dönem 16'nın `max-height:300px` sınırı zaten kalıcı hale geldi).
+  Onun yerine `SnapshotView`'da sağ sütunun SARMALAYICISINA
+  (3 kartı saran flex-column div) sol panelin ölçülen yüksekliği
+  `min-height` olarak veriliyor, `justify-content:space-between`
+  ekleniyor — 3 kart kendi boyutunda kalırken ARALARINDAKİ boşluk
+  büyüyüp küçülerek yığının TOPLAM yüksekliği sol panelle eşitleniyor.
+  Dead code temizliği: `headerRef` ölçümü, `props.headerRef`,
+  `props.matchHeight`/`props.headerMatchHeight` tamamen kaldırıldı.
+- **Doğrulama:** masaüstünde JS ile `rankingBottom === rightColBottom
+  === lastCardBottom` (884px, üçü de) VE `leftHeaderFontSize ===
+  rightHeaderFontSize` ("13px" = "13px") aynı anda teyit edildi; YtD
+  kartının yüksekliği 682px (zorlanmış) → 311px (doğal) düştüğü
+  ölçüldü. Rasyo modu, koyu mod, mobil (0 taşan element) ekran
+  görüntüsüyle kontrol edildi. 78 test yeşil.
+
+### Dönem 19 — Delta başlığı küçültüldü, başlık hizalaması geri geldi (2026-09-10)
+
+- **Tetikleyici:** Dönem 18'de tüm `.bank-ranking-header > div` hücreleri
+  13px'e büyütülünce "Pazar Payı Değişimi (Bps)" / "Çeyreklik Değişim"
+  de (dar 82px sütunda) orantısız büyümüştü — kullanıcı bunun küçük
+  kalmasını istedi. Ayrıca Dönem 18'de kart-gövdesi zorlamasıyla BİRLİKTE
+  kaldırılan başlık-yükseklik eşitlemesinin **yalnızca kart gövdesi**
+  için kaldırılması gerektiği, başlıkların yine de yatayda hizalı
+  kalması istendiği netleşti.
+- **Delta başlığı küçültme:** JSX'te delta hücresine ayrı bir
+  `bank-ranking-header-delta` class'ı verildi (`h('div', {className:
+  'bank-ranking-header-delta'}, ...)` — eskiden `h('div', null, ...)`),
+  CSS'te `font-size:10,5px !important; font-weight:600 !important;
+  color:#64748b !important` ile ana başlıktan (13px/700) ayrıştırıldı.
+  `!important` gerekli çünkü `.bank-ranking-header > div` seçicisi aynı
+  specificity'de sonra tanımlanmış olsa bile class seçicisiyle
+  spesifiklik farkı net değildi — güvenli taraf seçildi.
+- **Başlık hizalamasının geri getirilmesi:** Dönem 18'de tamamen
+  kaldırılan `headerRef`/`headerMatchHeight` mekanizması `SnapshotView`
+  ve `YtDGrowthChart`'a AYNEN geri eklendi — ama bu kez `matchH`/
+  `rightColStyle`'dan (kart gövdesi zorlaması, Dönem 18'de kazanılan
+  esnek `space-between` hizalaması) tamamen BAĞIMSIZ, paralel bir
+  ölçüm. İki mekanizma birbirini etkilemiyor: biri yalnızca başlık
+  şeridinin yüksekliğini eşitliyor, diğeri kartların toplamının nerede
+  bittiğini.
+- **Doğrulama:** masaüstünde JS ile `leftHeaderHeight ===
+  rightHeaderHeight` (60,375px = 60,375px), `deltaFontSize` = "10.5px",
+  `titleFontSize` (ana başlık) hâlâ "13px", VE `rankingBottom ===
+  lastCardBottom` (858,375px, kart gövdesi hizalaması hâlâ sağlam) aynı
+  anda teyit edildi. Rasyo modu, koyu mod, mobil (0 taşan element)
+  ekran görüntüsüyle kontrol edildi. 78 test yeşil.
+
+### Dönem 20 — Mobil topbar: hamburger menü (2026-09-10)
+
+- **Tetikleyici:** kullanıcı, mobilde BDR/Admin/Tema/Şifre/Çıkış/
+  Yenilikler butonlarının hepsinin tek tek görünüp dikey yer kaplaması
+  yerine, tıklanınca açılan bir menü barının arkasına toplanmasını
+  istedi.
+- **Yapılan (`TopBar`):** yeni `menuOpen` state'i + hamburger buton
+  (`.topbar-menu-btn`, CSS ile ikona dönüştürülmüş `.topbar-menu-icon`,
+  açıkken X'e morphluyor). `.topbar-toolbar`'ın className'ine
+  `menuOpen` durumuna göre `' open'` ekleniyor. Her aksiyon
+  butonu (Tema/Şifre/Çıkış/Yenilikler) kendi işlevine ek olarak artık
+  `closeMenu()` çağırıyor — tıklanınca hem aksiyon gerçekleşiyor hem
+  menü kapanıyor. Link'ler (BDR, Admin) de aynı şekilde `onClick:
+  closeMenu` alıyor (navigasyon zaten sayfayı değiştiriyor ama anlık
+  geri bildirim için).
+- **Backdrop:** `menuOpen` true iken `.topbar-menu-backdrop` (tam ekran,
+  yarı saydam siyah) render ediliyor — tıklanınca `closeMenu()`.
+- **CSS (yalnız ≤900px):** `.topbar-toolbar` varsayılan `display:none`;
+  `.open` durumunda `position:absolute` ile topbar'ın hemen altında,
+  3 sütunlu bir grid panel (`.topbar-icon-btn`'ler + en altta STRATEJİ
+  logosu, ince bir ayraçla ayrılmış) olarak açılıyor. Masaüstünde
+  (`.topbar-menu-btn { display:none }` varsayılan) hamburger hiç
+  görünmüyor, toolbar her zamanki gibi tek satırda açık.
+- **Doğrulama:** mobilde (375px) menü kapalıyken topbar yüksekliği
+  ciddi küçüldü (yalnızca başlık + hamburger satırı); menü açıkken 3×2
+  grid + STRATEJİ logosu ekran görüntüsüyle doğrulandı; Tema butonuna
+  tıklayınca hem tema değiştiği hem menünün otomatik kapandığı JS ile
+  teyit edildi; backdrop'a tıklayınca da kapandığı doğrulandı. Menü
+  açık/kapalı her iki durumda da 0 taşan element. Masaüstünde (1400px)
+  hamburger hiç görünmüyor, toolbar değişmedi — regresyon yok. 78 test
+  yeşil (frontend-only).
+
+### Dönem 21 — YtD kartında banka isimleri kırpılıyordu (2026-09-10)
+
+- **Tetikleyici:** kullanıcı, "İlk 20 Banka YtD Büyüme" kartındaki banka
+  isim etiketlerinin (dikey yazı) "çok sınırda" göründüğünü bildirdi,
+  kartın büyütülmesini istedi.
+- **Kök neden (gerçek bug, salt görsel tercih değil):** JS ile ölçüldü
+  — en uzun etiket ("Garanti Bankası", 15 karakter) gerçek yükseklik
+  ihtiyacı ~86px iken, `.ytd-labels-row` yüksekliği 80px'e sabitliydi
+  (Dönem 16'da 70→80px yapılmıştı, yeterli değilmiş). `.ytd-label-cell`
+  `overflow:visible` olduğu için satırın kendisi kırpmıyordu, ama fazlalık
+  `.panel`'in (`overflow:hidden`, yuvarlak köşeler için) sınırına
+  taşınca ORADA kırpılıyordu — etiketin gerçek render yüksekliği 33px
+  ölçüldü (tam metnin sadece ~%38'i görünür kalıyordu).
+- **Yapılan:** `.ytd-labels-row` yüksekliği 80px → 150px,
+  `.ytd-chart-container`'ın `max-height`'ı (Dönem 16'da 300px'e
+  sınırlanmıştı) 300px → 420px — kart artık en uzun ismi rahatça
+  sığdıracak kadar büyük.
+- **Yan etki — panel hizalaması hafifçe bozuldu:** Dönem 18'in
+  `space-between` mekanizması sağ sütunun 3 kartını sol panelin
+  yüksekliğine (`min-height`) göre yayıyordu; YtD kartı büyüyünce sağ
+  sütunun DOĞAL toplam yüksekliği sol panelinkini ~38px aştı
+  (`min-height` bir taban, üstüne çıkmayı engellemiyor). Ekran
+  görüntüsünde bu fark görsel olarak fark edilmiyor (900px'lik toplam
+  yükseklikte ~38px); kullanıcının bu turdaki net talebi (kırpılmayı
+  düzelt) önceliklendirildi, ekstra hizalama telafisi yapılmadı —
+  gerekirse sonraki bir dönemde ele alınabilir.
+- **Doğrulama:** masaüstünde JS ile 20 etiketin TAMAMININ panel sınırı
+  içinde kaldığı (`clippedCount: 0`) teyit edildi. Koyu mod ve mobil
+  (0 taşan element) ekran görüntüsüyle kontrol edildi. 78 test yeşil.
+
+### Dönem 22 — STRATEJİ logosu mobilde her zaman görünür (2026-09-10)
+
+- **Tetikleyici:** Dönem 20'de STRATEJİ logosu hamburger menünün İÇİNE
+  (yalnızca açılınca görünen dropdown panele) yerleştirilmişti. Kullanıcı
+  bunun yerine logonun mobilde hamburger'in hemen yanında, her zaman
+  (menü kapalıyken de) görünmesini istedi.
+- **Yapılan (`TopBar`):** `topbar-brand` (logo) JSX'i `topbar-toolbar`'ın
+  İÇİNDEN çıkarılıp bağımsız bir kardeş eleman olarak `topbar-menu-btn`'in
+  hemen öncesine taşındı — artık `menuOpen` durumundan bağımsız, her
+  zaman render ediliyor. `.topbar-toolbar.open .topbar-brand` CSS kuralı
+  (artık geçersiz) kaldırıldı.
+  - **Masaüstü:** `.topbar-brand { order: 3 }` (taban CSS) — DOM'da artık
+    toolbar'dan ÖNCE olsa da, flex `order` ile eskisi gibi toolbar'ın
+    SONUNDA (en sağda) görünmeye devam ediyor. Hamburger zaten
+    `display:none` olduğu için mobil-özel sıralama etkisiz.
+  - **Mobil (≤900px):** `.topbar-brand { order: 2 }`,
+    `.topbar-menu-btn { order: 3 }` (eskiden 2) — logo artık hamburger'in
+    hemen solunda sabit duruyor. `.topbar-left`'in ayrılan genişliği
+    (`calc(100% - 52px)` → `calc(100% - 118px)`) logo+hamburger'in
+    ikisine birden yer açacak şekilde büyütüldü.
+- **Doğrulama:** mobilde (375px) logo menü kapalıyken de görünür,
+  hamburger'e tıklayıp menü açılınca logo aynı yerde kalıyor ve
+  dropdown panelde TEKRARLANMIYOR (`document.querySelectorAll(
+  '.topbar-brand').length` menü açık/kapalı ikisinde de 1) JS ile teyit
+  edildi. 0 taşan element. Masaüstünde (1400px) JS ile `brandLeft >
+  toolbarRight` (logo toolbar'dan sonra, eski konumunda) ve
+  `menuBtnDisplay: 'none'` teyit edildi — regresyon yok. 78 test yeşil.
+
+### Dönem 23 — Orta genişlik masaüstünde toolbar "Rakip Analizi" ile çakışıyordu (2026-09-10)
+
+- **Tetikleyici:** kullanıcı, masaüstü görünümünde BDR/Admin gibi
+  toolbar butonlarının "Rakip Analizi" ortadaki başlığın ALTINDA
+  kaldığını (çakıştığını) bildirdi.
+- **Kök neden #1 — Dönem 22'nin yan etkisi:** `.topbar-brand`'in
+  `topbar-toolbar`'ın İÇİNDEN çıkarılıp bağımsız bir kardeş eleman
+  yapılması, `.topbar`'ın `justify-content:space-between`'inin artık
+  3 flex elemanı (topbar-left, topbar-brand, topbar-toolbar — eskiden
+  yalnızca 2: topbar-left ve toolbar) görmesine yol açtı.
+  `space-between` 3 öğeyi EŞİT ARALIKLA dağıtır — bu da toolbar'ı sağ
+  kenardan MERKEZE doğru kaydırıp ortadaki absolute-konumlu
+  "Rakip Analizi" bloğuyla çakıştırdı. Düzeltme: `.topbar`
+  `justify-content:space-between` → `flex-start` + `gap:14px`,
+  `.topbar-left`'e `margin-right:auto` — artık kaç flex öğesi olursa
+  olsun sol blok sabit kalıyor, geri kalanı (brand+menu-btn+toolbar)
+  tek grup halinde sağa yaslanıyor.
+- **Kök neden #2 — ÖNCEDEN VAR OLAN, bağımsız bir sorun:** yukarıdaki
+  düzeltmeden SONRA bile JS ile 1050px genişlikte gerçek bir piksel
+  çakışması ölçüldü (`overlap: true`, ~50px). Sebep: ortadaki
+  "Rakip Analizi" bloğu yalnızca ≤980px'te gizleniyordu, ama
+  toolbar'ın (6 buton + logo) gerçek genişliği bu eşiğin ÜZERİNDEKİ
+  genişliklerde (ör. 1000-1200px — yaygın bir laptop/yarı-ekran
+  masaüstü aralığı) hâlâ ortadaki bloğa değecek kadar büyüktü. Bu,
+  Dönem 22'den ÖNCE de var olan bir tasarım boşluğuydu (toolbar içeriği
+  o zaman da aynı toplam genişlikteydi, sadece STRATEJİ logosu
+  toolbar'ın kendi içindeydi) — kullanıcı bu turda fark edip bildirdi.
+  Düzeltme: iki `@media (max-width: 980px)` eşiği (ortadaki bloğu
+  gizleyen ve sol bloğa fazladan yer açan) `1200px`'e çıkarıldı.
+- **Doğrulama:** JS ile genişlik taraması yapıldı — 1050px'te önce
+  `overlap:true` ölçülüp düzeltmeden sonra ortadaki blok
+  `centerBrandVisible:false` olduğu (çakışma riski ortadan kalktı)
+  teyit edildi; 1210px'te (yeni eşiğin hemen üstü) `overlap:false`,
+  `gap:30px` güvenli boşluk ölçüldü; 1250px ve 1400px'te de çakışma
+  yok. 920px'te (mobil hamburger eşiğinin hemen üstü) toolbar satır içi
+  görünümde sorunsuz. Mobilde (375px) hamburger/logo davranışı ve 0
+  taşan element yeniden teyit edildi. 78 test yeşil.
+
+---
+
+### Dönem 24 — BDR-Kısayol JSON entegrasyonu, Faz 1 (2026-09-12)
+
+- **Bağlam:** Kullanıcı, ayrı bir araç olan **bdr-kisayol-main**'in
+  (BDDK PDF'lerini ayrıştırıp `<DÖNEM>.json` üreten proje,
+  `/Users/farukkezer/Desktop/AI LAB/bdr-kisayol-main/VERI-FORMATI.md`)
+  çıktısını, mevcut Rasyonet/xlsx abonelik maliyetinden kurtulmak için
+  Rakip Analizi'nin veri kaynağı yapmak istiyor. Bu Dönem 24, §8.5'teki
+  "PDF fazı" FAZ 1'inin ilk somut adımı — ama PDF'i doğrudan parse etmek
+  yerine bdr-kisayol-main'in ZATEN ürettiği yapılandırılmış JSON'u tüketiyor.
+- **Kapsam kararı (kullanıcıdan):** Faz 1 = **destekleyici/test** — üretim
+  verisine (`computed.json`, `veriler.parquet`, `data/raw/`) HİÇBİR YAZMA
+  yapılmaz. Türetim/hesaplama mantığı `pipeline/measures.py`'de KALIR — yeni
+  format sadece alternatif bir ham-veri kaynağı.
+- **Doğrulama metodolojisi:** Varsayımla değil, gerçek bir örnek dosyayı
+  (`/Users/farukkezer/Desktop/BDR-Arsiv/cikti/2026-2C.json`, 27 banka)
+  Akbank/Kuveyt Türk için `data/computed.json`'daki GERÇEK değerlerle
+  birebir karşılaştırarak ilerlendi — her yeni tablo eşlemesi (mvy,
+  kalan_vade, sermaye_ozet+risk_agirlikli, tk_detay, grup12, donuk_akim,
+  faaliyet_gid_detay, olgular) sayısal olarak doğrulandı.
+- **Eklenenler:**
+  - `pipeline/cikti_ingest.py` — çıktı JSON → mevcut long-format ara formata
+    (Banka Adı/Tarih/Tablo Türü/Tablo Adı/Kalem Adı/Para Birimi/Tutar)
+    dönüştürücü. `pipeline/lookup.py`/`pipeline/measures.py` HİÇ değişmedi.
+  - `pipeline/cikti_compare.py` — hesaplanan hücreleri computed.json'la
+    karşılaştırıp uyuşan/farklı/yeni/kaynakta-yok özeti üretir.
+  - `POST /admin/cikti-test-upload` (`app.py`) — tek JSON dosyası kabul eder,
+    `heavy_op_guard` ile korunur, hiçbir dosyaya yazmaz.
+  - Admin panelde "🧪 BDR JSON Test Yükleme" bölümü (`frontend/admin.html`).
+  - `tests/test_cikti_ingest.py` — gerçek örnek dosyaya karşı 20 regresyon
+    testi (dosya bu makineye özel olduğu için yoksa otomatik skip edilir).
+- **Bulunan BDDK-şablonu tuzakları** (ileride benzer bir eşleme yapacak biri
+  için): (1) bilanço/gelir tablosunun üst-düzey (Roma rakamı) satırları
+  çıktı'da TÜMÜ BÜYÜK HARF geliyor, Rakip'in raw'ı Title Case — 20 kadar
+  satır için elle eşleme gerekti; (2) bazı kalemlerde bağlaç ("ve"/"ile")
+  büyük/küçük harf TUTARSIZ (`Alınan Ücret Ve Komisyonlar` vs çıktı'nın
+  `Alınan Ücret ve Komisyonlar`) — genel bir alias mekanizmasıyla çözüldü;
+  (3) `_brut_krediler` ile `grup_1_krediler`'in AYNI 'Donuk Alacaklar' kalemini
+  BEKLEDİĞİ ama farklı anlamlar taşıdığı ortaya çıktı — donuk_akim'den tek bir
+  sentetik değer üretmek biri düzeltirken diğerini bozdu (regresyon testinde
+  yakalandı), bu yüzden `grup_1_krediler`/`grup_1_krediler_toplam` bilinçli
+  olarak kapsam dışı bırakıldı; (4) `İtfa Edilmiş Maliyeti ile Ölçülen
+  Finansal Varlıklar` kod II'nin GRAND TOTAL'i değil alt kalemi 2.4'e karşılık
+  geliyor — `finansal_varliklar_net_ta`'nın %92 gibi anlamsız bir oran vermesi
+  bunu ele verdi.
+- **Sonuç (2026-2Ç, 27 banka, tek çeyrek):** 148 ölçünün (12
+  BASELINE_PASSTHROUGH hariç) ~1833/3571 hücresi (%51) birebir/tolerans
+  dahilinde uyuşuyor — büyük/kritik ölçüler (Toplam Aktifler, RAV, Toplam
+  Özkaynaklar, Likidite Açığı ×7, Vadesiz/Vadeli Mevduat, Tüketici Kredileri,
+  Grup 2 Krediler, Şube/Personel Sayısı, Reklam Giderleri) byte-exact.
+  Kalan fark, çoğunlukla (a) TCMB tablosu gerektiren detaylı faiz-getirili/
+  maliyetli-pasif formülleri (kapsam dışı bırakıldı), (b) tek çeyreklik
+  yüklemenin avg-balance/TTM ölçülerini (ROAA, NPL formasyonu vb.) tam
+  besleyememesi (yapısal — birden fazla çeyrek yüklenince kendiliğinden
+  düzelir), (c) `tfv` tablosunun bazı katılım bankalarında eksik gelmesi.
+  Bu üçü de `pipeline/cikti_ingest.py`'nin modül docstring'inde belgeli.
+- **Doğrulama:** `pytest tests/` → 98/98 yeşil (20 yenisi dahil). Endpoint
+  gerçek 2026-2C.json ile uçtan uca çağrıldı; `data/computed.json` ve
+  `data/veriler.parquet`'in MD5'i çağrı öncesi/sonrası DEĞİŞMEDİ (Faz 1'in
+  "üretime dokunmama" garantisi somut olarak doğrulandı).
+- **Sıradaki adım (kullanıcı onayı gerekir):** birkaç çeyrek boyunca bu
+  test-modunda kullanıp güven oluşunca Faz 2'ye (gerçek veri kaynağı değişimi)
+  karar vermek; ayrıca uzun kuyruklu kalan ölçülerin (yukarıdaki (a)/(c))
+  eşlemesini derinleştirmek istenirse ayrı bir oturumda ele alınabilir.
+
+---
+
+### Dönem 25 — 12 passthrough ölçüden 6'sı raw'a taşındı (2026-09-12)
+
+- **Tetikleyici:** kullanıcı, kalan 12 `BASELINE_PASSTHROUGH` ölçünün nasıl
+  türetildiğini araştırmamı, JSON'dan hesaplayıp geçmiş dönem verisiyle
+  tutuyorsa Python koduna kaydetmemi istedi.
+- **Yöntem:** önce standart bankacılık formülleri (RORWA, NIM, Net Interest
+  Spread — web araması ile doğrulandı) ve kodda zaten YAZILMIŞ ama hiç
+  MEASURE_FUNCS'a bağlanmamış "taslak" fonksiyonlar (`m_spread`, `m_nim`,
+  `m_maliyet_gelir`, `m_nim_bzk_sonrasi`, `m_faiz_getirili_aktif_getirisi`)
+  incelendi; her aday, `data/veriler.parquet` (GERÇEK xlsx ham verisi) +
+  `data/computed.json`'daki DONMUŞ v29 baseline değerleriyle TÜM tarihsel
+  (banka, tarih) noktalarında karşılaştırılarak test edildi.
+- **Beklenmeyen keşif — SYR/Çekirdek SYR hiç "türetilmiş" değil:** ham
+  xlsx verisinde ('Kredilere İlişkin Olarak Ayrılan Özel Karşılıklar' adlı,
+  BDDK şablonunda mislabeled bir sayfada) BDDK'nın KENDİSİ zaten
+  'Sermaye Yeterlilik Rasyosu (%)' ve 'Çekirdek Sermaye Yeterliliği Oranı
+  (%)'yi hesaplayıp raporluyor — RAV/Özkaynak'tan ayrıca formül kurmaya
+  hiç gerek yokmuş. `pipeline/lookup.py`'ye yeni bir `sermaye_orani` tablo
+  indeksi + `ctx.sermaye_orani()` erişimcisi eklendi.
+- **Taşınan 7 ölçü** (`pipeline/measures.py`, hepsi 1054-1055↔948 arası
+  tarihsel noktada test edildi):
+  | Ölçü | Uyum (±0.5pp) | Not |
+  |---|---|---|
+  | `syr` | %98.4 (medyan fark 0) | Doğrudan ham veri, formül değil |
+  | `cekirdek_syr` | %99.3 (medyan fark 0) | Doğrudan ham veri, formül değil |
+  | `gayrinakdi_komisyon_gayrinakdi` | %99.8 (medyan fark 0) | Payda ORTALAMA değil DÖNEM SONU bakiye olunca %99.1'den %99.8'e çıktı |
+  | `maliyet_gelir` | %92.4 (medyan fark 0, %88.6'sı ±0.01pp) | Kullanıcının "neden burada problem yaşanıyor" sorusu üzerine derinleştirildi — İKİ hata birden bulundu: (1) payda 3 kalemle sınırlıydı, ham veride hazır 'Faaliyet Gelirleri/Giderleri Toplamı' kalemi (Temettü+Diğer Faaliyet Gelirleri dahil, Akbank'ta birebir doğrulandı) kullanılmalıymış; (2) TTM yıllıklandırması YANLIŞ uygulanmıştı — bu rasyo PBI'da YtD/YtD (annualize edilmiyor). İkisi düzelince %5.1'den %92.4'e çıktı |
+  | `rorwa` | %96.1 (medyan fark 0) | TTM Net Dönem Karı / Ortalama RAV |
+  | `net_faiz_ort_rav` | %95.0 (medyan fark 0) | TTM Net Faiz Geliri / Ortalama RAV |
+  | `faiz_getirili_aktif_getirisi` | %92.5 (medyan fark 0) | Payda basit (4 bileşen) yerine DETAYLI (13 bileşen, TCMB tablolu) `_faiz_getirili_aktif_detay` kullanılınca %30.3'ten %92.5'e çıktı |
+
+  Kalan sapmanın büyük kısmı küçük/yeni/veri-kalitesi-istisnalı bankalarda
+  (Emlak Katılım, Dünya Katılım, Hayat Finans, TOM Bank, Alternatif Bank,
+  Odeabank) yoğunlaşıyor — bu bankalar projenin diğer ölçülerinde de
+  tarihsel olarak benzer istisnalar taşıyor.
+- **Bilinçli olarak passthrough'da BIRAKILAN 5 ölçü** (denendi, eşik
+  altında kaldı): `nim` (basit payda %52.5, detaylı payda %81.7 — hâlâ
+  yetersiz; YtD/TTM hipotezi de denendi, işe yaramadı — NIM'in gerçekten
+  yıllıklandırılması gerekiyor), `nim_bzk_sonrasi` (%43), `spread` (detaylı
+  bileşenlerle %78.3), `maliyet_gelir_duzeltilmis` ve `nim_duzeltilmis`
+  (PBI'ın "düzeltme" mantığı hiç belgelenmemiş, araştırılmadı). Bunlar için
+  proje geçmişinin kendi standardı ("gayrinakdi
+  krediler" 99.6% eşleşmeden önce taşınmamıştı) korundu — %85 altı uyum
+  oranıyla üretime yazılmadı.
+- **Üretim etkisi:** Bu bir KOD değişikliği — `data/computed.json` bu turda
+  YAZILMADI. Değişiklik, kullanıcı bir dahaki xlsx upload'ında veya
+  `/admin/rebuild` çalıştırdığında devreye girecek. O noktada: (a) bu 7
+  ölçünün DONMUŞ (v29'dan hiç güncellenmemiş) değerleri güncel ham veriden
+  taze hesaplanacak — dahil olmak üzere ŞU AN hiç değeri olmayan en güncel
+  çeyrekler (ör. SYR/Çekirdek SYR artık 2026-06-30 için de var), (b) küçük
+  bir azınlık (özellikle yukarıdaki veri-kalitesi-istisnalı bankalar)
+  hücresinde değer hafifçe değişecek (frozen v29 → taze hesap) — bu istenen
+  bir düzeltme, regresyon değil.
+- **Doğrulama:** `tests/test_baseline_promoted.py` (yeni, 7 test — gerçek
+  veriye bağımlı, yoksa skip) + `pytest tests/` → 105/105 yeşil.
+
+### Dönem 26 — Grup hariç-tutma, tüm bankalar, interaktif Rakip Bankalar, sürüm takibi (2026-09-16)
+
+*(Bkz. format notu yukarıda — bundan sonraki girdiler bu kısa madde stilinde.)*
+
+- **v1.2:** grup agregasyonunda (`_agg_ratio`/`_agg_simple_avg`) veri/uygulanabilirliği
+  olmayan üye artık hariç tutulup kalanlarla hesaplanıyor (`_agg_size` hariç,
+  değişmedi — bkz. §5.6).
+- **v1.2:** banka sıralama listeleri sabit top-20'den tüm bankalara genişletildi
+  (kaydırılabilir liste, ilk görünüm yine ~20 satır).
+- **v1.2:** rasyo bazlı Banka Grupları/Çeyreklik Değişim kartları büyütülüp
+  aradaki boşluk azaltıldı.
+- **v1.2:** uygulama genelinde küçük yazı taraması yapıldı; Rakip Bankalar
+  kartları önce 3×2'ye çıkarıldı, sonra kullanıcı isteğiyle tek sıraya
+  geri alınıp hover/tık ile açılan popover'a çevrildi (okunabilirlik artık
+  statik büyütmeyle değil etkileşimle çözülüyor); Rakip Bankalar trend
+  grafiğine TrendView ile tutarlı hover-tooltip eklendi.
+- **v1.3:** kullanıcı geri bildirimi ("baloncuklar çok büyük") üzerine
+  popover 230px→180px küçültüldü, `openFor()` artık ekran sınırlarına göre
+  left/openUp clamp ediyor (taşma/kesilme yok, her zaman tek ekranda tam
+  görünür).
+- **v1.3:** `whats_new.json`'a `version` alanı eklendi. Geçmiş tek
+  whats_new girdisi retroaktif v1.0 sayıldı; 2026-08-25→2026-09-12 arası
+  (Dönem 3-25, o zaman whats_new'e hiç işlenmemişti) özet olarak v1.1'e
+  yazıldı.
+- **v1.3 (düzeltme, aynı gün):** kullanıcı "whats new'e versiyon/tarih
+  koyma, üyeler sadece en son sürümü görsün; aşama aşama versiyonlu
+  backlog SADECE admin panelde olsun" dedi. Buna göre: `/api/whats-new`
+  (üye) artık SADECE en son girdiyi, versiyon/tarih OLMADAN döndürüyor
+  (`api_whats_new`, app.py); tam geçmiş yeni bir admin-only endpoint'e
+  taşındı (`GET /api/admin/version-log`, `require_admin_access`). Admin
+  panelde yeni bir **"🗂️ Backlog"** sekmesi eklendi (`frontend/admin.html`)
+  — "📖 Proje El Kitabı" sekmesinden AYRI: Proje El Kitabı derin teknik
+  referans, Backlog sekmesi ise whats_new.json'daki sürüm+tarih+madde
+  listesini kısa/okunur biçimde gösteren, haftalık toplantılarda
+  kullanılacak özet. Topbar'daki "Yenilikler" butonundan sürüm rozeti
+  kaldırıldı (üyeler sürüm numarası görmemeli).
+- **Testler:** `pytest tests/` → 111/111 yeşil (saf frontend + agregasyon
+  mantığı, veri şeması değişmedi).
+- **Commit'ler:** henüz push edilmedi (bu dönem + önceki oturumdaki 5 commit).
+
+---
+
+### Dönem 27 — Ölçü info kartları (2026-09-18)
+
+- **v1.4:** `docs/olcu_info_kartlari.md`'de elle derlenmiş 161 ölçünün
+  Tanım/Formül/Hesaplama Dönemi/Kaynak/Kategori/Terimler/Not bilgileri
+  artık dashboard'da doğrudan görünüyor. Yeni `pipeline/measure_info.py`
+  bu markdown'ı regex'le parse edip `id:` alanına göre bir sözlüğe
+  dönüştürüyor (dosya mtime'ına göre cache'leniyor); yeni
+  `GET /api/measure-info` endpoint'i (üye girişi gerekir) bunu JSON
+  olarak servis ediyor.
+- **v1.4:** Frontend, `/api/data` ile aynı bootstrap adımında
+  `/api/measure-info`'yu da çekip `DATA.measureInfo`'ya koyuyor. ÖLÇÜ
+  seçicisinin yanına küçük bir "i" butonu eklendi (`ControlBar`).
+- **v1.4 (düzeltme, aynı gün):** İlk sürüm tıklanınca açılan, ekranı
+  kaplayan bir modal'dı (`pw-modal-overlay`) — kullanıcı "ekranı kaplayan
+  bir baloncuktan ziyade üstüne gelince baloncuk olarak gözüksün" dedi.
+  `MeasureInfoModal` kaldırılıp `MeasureInfoPopover`'a çevrildi:
+  `CompetitorCardsGrowth`'taki (Dönem 26) hover/tık-pinleme deseninin
+  AYNISI (`openFor`/`scheduleClose`, buton `getBoundingClientRect()`'ine
+  göre `position:fixed` konumlanan, ekran sınırına göre üst/alt clamp
+  edilen 340px'lik baloncuk) — üstüne gelince anında açılıyor, fareyle
+  ayrılınca kısa gecikmeyle kapanıyor, dokunmatik için tıklayınca pinleniyor
+  (dışına tıklayana/× 'e kadar açık kalıyor). İçerik aynı: Tanım, Formül,
+  Dönem/Kaynak/Birim/Tip, Terimler sözlüğü, varsa "PBI baseline" gibi durum
+  rozeti ve ℹ️/⚠️ notlar.
+- **Doğrulama:** `docs/olcu_info_kartlari.md`'deki 161 kart, canlı
+  `catalog.seed.json`'daki 161 ölçünün TAMAMIYLA birebir eşleşiyor (id
+  karşılaştırmasıyla doğrulandı, eksik yok). Tarayıcıda "Toplam Aktifler"
+  (basit kart), "Düzeltilmiş Net Faiz (Kar Payı) Marjı (NIM)" (Terimler +
+  ℹ️ not içeren kart) ve "Düzeltilmiş Maliyet / Gelir Rasyosu" (Durum
+  rozeti + ⚠️ uyarı içeren kart) manuel test edildi — hem masaüstü hem
+  mobil (375px) genişlikte doğru render edildi.
+- **Yan doğrulama:** Bu test sırasında Dönem 26 sonrası (henüz bu dosyaya
+  işlenmemiş) NIM formül düzeltmesinin (`nim`/`nim_duzeltilmis`/
+  `nim_bzk_sonrasi`) canlıda gerçek, mantıklı değerler ürettiği de teyit
+  edildi (ör. Kuveyt Türk Düzeltilmiş NIM %8,06 — "veri yok" değil).
+- **Testler:** `pytest tests/` → 111/111 yeşil.
+- **Commit'ler:** henüz commit edilmedi.
+
+> ⚠️ **Not:** `docs/backlog-visual.html` görsel artifact'ı Dönem 26'dan
+> beri (bu dönem dahil) güncellenmedi — standing talimat gereği senkron
+> tutulması gerekiyor, ayrı bir turda yapılmalı.
+
+---
+
+### Dönem 28 — Grafikler animasyonlu hale getirildi (2026-09-18)
+
+- **v1.5:** Kullanıcı isteği ("grafikleri animasyonlu hale getir") üzerine
+  `frontend/index_v30.html`'deki tüm grafik türlerine saf CSS animasyon
+  eklendi — yeni bir kütüphane/bağımlılık YOK:
+  - **Çizgi grafikler** (`TrendView` ana grafik, `CompetitorTrendRatio`):
+    `pathLength="1"` trick'i ile `stroke-dasharray:1; stroke-dashoffset:1`
+    → `0` animasyonu — gerçek path uzunluğundan bağımsız, her zaman TAM
+    soldan-sağa "çizim" efekti (`.trend-line-draw`, `@keyframes
+    chartLineDraw`). Kesikli (tahmini/dashed) çizgilerde bu trick gerçek
+    kesik-çizgi deseniyle çakışacağından onun yerine sade opacity fade
+    kullanıldı (`.trend-line-fade`). Alan dolgusu ayrı fade
+    (`.trend-area-fade`), noktalar gecikmeli fade (`.trend-dot-fade`).
+  - **Bar grafikler** (`BankRanking`, `YtDGrowthChart`, `CompositionView`
+    yığın barları): bunlar zaten div + CSS `width`/`height` yüzdesiyle
+    çiziliyordu (SVG değil) — sadece `transition` eklendi (`.bank-bar`,
+    `.bank-delta-bar`, `.ytd-bar-fill`, `.comp-bar-segment`). Değer
+    değişince (ölçü/tarih/filtre) DOM node'u AYNI kaldığı için (key sabit,
+    ör. banka adı) tarayıcı otomatik yumuşak geçiş yapıyor — ayrı bir
+    "0'dan başlat" orkestrasyonuna gerek yok.
+  - **Rakip Bankalar popover mini-grafiği** (`CompetitorCardsGrowth`):
+    SVG `rect` barlarına `transform-box:fill-box; transform-origin:bottom`
+    + `scaleY(0)→scaleY(1)` (`.chart-bar-grow`), index'e göre 70ms
+    gecikmeli (staggered) — popover her açılışta (hover/tık) yeniden
+    mount olduğu için animasyon her seferinde oynuyor.
+  - **Animasyonun veri değişince TEKRAR oynaması:** CSS `animation`
+    (transition'ın aksine) sadece DOM mount'ta bir kez oynar. Çizgi
+    grafiklerdeki `<g>`/`<path>` elemanlarının `key`'i bu yüzden veriye
+    bağlandı (`s.name + '_' + tarih + '_' + mod + '_' + measure.id` gibi)
+    — React'i o node'u remount etmeye zorlayıp animasyonu her tarih/ölçü/
+    mod değişiminde tekrar tetikliyor.
+  - **Erişilebilirlik:** `@media (prefers-reduced-motion: reduce)` bloğu
+    tüm bu animasyon/transition'ları `none`'a çeviriyor.
+- **Doğrulama:** Tarayıcıda Trend moduna geçilip canlı olarak çizgilerin
+  soldan sağa çizildiği (ekran görüntüsü animasyon ORTASINDA yakalandı),
+  çeyrek değiştirilince (Haziran→Mart 2026) animasyonun TEKRAR oynadığı,
+  ölçü değiştirilince (Toplam Aktifler→Krediler) bar genişliklerinin
+  güncellendiği, Rakip Bankalar kartına hover'da mini-grafiğin doğru
+  render edildiği doğrulandı. Konsol hatası yok.
+- **Testler:** `pytest tests/` → 111/111 yeşil (saf CSS/frontend
+  değişikliği, backend/veri şeması dokunulmadı).
+- **Commit'ler:** henüz commit edilmedi.
+
+---
+
+### Dönem 29 — tp_spread/yp_spread placeholder'dan çıkarıldı (2026-09-21)
+
+- **Tetikleyici:** kullanıcı "TP Kredi Mevduat Spread'i" ve "YP Kredi
+  Mevduat Spread'i" ölçülerinin hiç hesaplanmadığını bildirip orijinal PBI
+  DAX formülünü verdi: `((1+[TP/YP Kredilerin Getirisi]) /
+  (1+[TP/YP Vadeli Mevduatın Maliyeti]) − 1) × 10000`. Önceden
+  `m_tp_spread`/`m_yp_spread` (`pipeline/measures.py`) doğrudan `None`
+  dönen placeholder'dı — ham veride TP/YP kırılımlı karşılığı
+  bulunamadığı için 2026-09-09'da (Dönem 9 civarı) hiç ele alınmamıştı.
+- **Keşif:** Gelir Tablosu'nun ANA tablosunda ('Kredilerden Alınan
+  Faizler'/'Mevduata Verilen Faizler') TP/YP kırılımı YOK — ama iki
+  DİPNOT tablosunda var, önceden `pipeline/lookup.py`'de HİÇ
+  indekslenmemişti:
+  - `' Kredilerden Alınan Faiz Gelirlerine İlişkin Bilgiler'` (başında
+    kasıtsız boşluklu BDDK şablon tuhaflığı) → `'Kredilerden Faizler
+    (Toplam, TP/YP)'` — kredi faiz geliri TP/YP kırılımlı.
+  - `'Mevduata Ödenen Faizin Vade Yapısına Göre Gösterimi'` → `'Mevduata
+    Ödenen Faiz (TP/YP, Toplam, Toplam/Vadesiz)'` — mevduat bankası için
+    ödenen faiz, TP/YP VE vade kırılımlı (Vadeli = Toplam − Vadesiz).
+  - Katılım bankaları "Mevduata Ödenen Faiz" hiç raporlamıyor (Kuveyt
+    Türk'te bu kalemler hep 0) — onlar için PARALEL bir dipnot tablosu
+    var: `'Katılma Hesaplarına Ödenen Kar Paylarının Vade Yapısına Göre
+    Gösterimi'` → `'Toplam -TP/YP Toplam'` (bu tabloda zaten vadesiz
+    eşleniği — Özel Cari Hesaplar — hiç yok, çıkarma gerekmiyor). Aynı
+    bank-type-aware dallanma deseni `ctx.vadesiz_mevduat`/`tuzel_mevduat`
+    ile birebir tutarlı (`pipeline/lookup.py`, yeni
+    `ctx.vadeli_mevduat_faizi(banka, tarih, pb)`).
+- **Bilinen yaklaşıklık (kullanıcıyla karara bağlandı):** payda için TP/YP
+  kırılımlı "Vadeli Mevduat BAKİYESİ" (stok) hiçbir tabloda raporlanmıyor
+  — sadece TP/YP kırılımlı TOPLAM Mevduat bakiyesi var (bilanço, vadesiz
+  dahil). Kullanıcı onayıyla payda için bu TOPLAM TP/YP Mevduat bakiyesi
+  kullanıldı; pay yine de GERÇEK vadeli-only faiz/kâr payı — maliyeti
+  hafifçe olduğundan düşük gösterebilir, docs/olcu_info_kartlari.md'de
+  ⚠️ ile belgelendi.
+- **Birim:** DAX ×10000 (baz puan) döner; kardeş ölçü
+  `kredi_mevduat_spread` ile tutarlılık için (catalog'da 'bps' birimi
+  desteklenmiyor) ×100 (yüzde puanı) kullanıldı.
+- **Doğrulama:** Kuveyt Türk/Ziraat/Akbank için Python'da elle hesaplanan
+  değerler (getiri/maliyet/spread) canlı arayüzdeki değerlerle BİREBİR
+  eşleşti (ör. KT TP spread %6,49, YP spread %6,40). 27 banka × son 8
+  dönem üzerinde hatasız çalıştı (2 (banka,tarih) çifti veri yokluğundan
+  None — beklenen). `scripts/recompute.py` sonrası tam diff: SADECE
+  `tp_spread`/`yp_spread` `bank_data`/`group_data`'sı değişti, başka
+  hiçbir ölçü etkilenmedi. `meta.available_measures` artık 161/161
+  (önceden bu ikisi eksikti). `pytest tests/` → 111/111 yeşil.
+- **Commit'ler:** henüz commit edilmedi. `data/computed.json` canlıda ayrı
+  güncellendi (git-ignored, bu commit'in parçası değil) — yedeği
+  `data/backups/computed_20260921_144016_pre_tpyp_spread.json`.
+
+---
+
+### Dönem 30 — spread/kredi_mevduat_spread/cost_of_risk düzeltildi (2026-09-21)
+
+- **Tetikleyici:** Dönem 29'un hemen ardından kullanıcı "Rasyolar (bps)"
+  SWITCH() ölçüsünün TAM DAX kodunu verdi — bu, `spread`/
+  `kredi_mevduat_spread`/`tp_spread`/`yp_spread`'i tek bir slicer'da
+  birleştiren PBI ölçüsüydü, ayrıca "Brüt CoR (bps)" ve "Kredi Mevduat
+  Spread'i" formüllerini de içeriyordu: "hesaplamalar yanlış geliyor."
+- **Kök neden (spread/kredi_mevduat_spread):** PBI'ın gerçek formülü
+  BİLEŞİK (`((1+getiri)/(1+maliyet)-1)×10000`), ama bu iki ölçü
+  ÖNCEDEN basit FARK (`getiri − maliyet`) ile hesaplanıyordu —
+  `m_spread` zaten "⚠️ EN İYİ TAHMİN, %78,3 uyum" diye işaretliydi,
+  `m_kredi_mevduat_spread` hiç işaretli bile değildi. Yeni ortak
+  `_compound_spread_pct()` helper'ı yazılıp `m_spread`,
+  `m_kredi_mevduat_spread`, `m_tp_spread`, `m_yp_spread` (Dönem 29)
+  hepsi bu TEK fonksiyonu kullanacak şekilde birleştirildi (kod tekrarı
+  önlendi).
+- **Kök neden (cost_of_risk / "Brüt CoR"):** DAX paydası "Ortalama Brüt
+  Krediler" diyor ama `m_cost_of_risk` NET krediler (`krediler()`)
+  kullanıyordu — hem bank-level (`measures.py`) hem grup-level
+  (`groups.py::_nd_cost_of_risk`) düzeltildi (`_brut_krediler`).
+  Pratikte çoğu bankada net≈brüt olduğundan sonuç neredeyse
+  DEĞİŞMEDİ (%96,7 uyum hem eski hem yeni formülle) — ama artık DAX'a
+  birebir sadık, yüksek-NPL bankalarda ayrışabilir.
+- **Doğrulama (v29 baseline'la, `data/computed_backup_2026-08-11.json`):**
+  spread %78,3→%92,8 (medyan fark 0), cost_of_risk %96,7 (değişmedi),
+  kredi_mevduat_spread %79,5 (iç "Mevduatın Paçal Maliyeti"
+  alt-formülü henüz doğrulanmadı — Durum: "Kısmen en iyi tahmin").
+  `scripts/recompute.py` sonrası tam diff: SADECE bu 3 ölçünün
+  `bank_data`/`group_data`'sı değişti. `tests/test_baseline_promoted.py`
+  güncellendi: nim/nim_duzeltilmis/nim_bzk_sonrasi/spread/cost_of_risk
+  artık YÜKSEK GÜVEN (PROMOTED) grubunda (gerçek ölçümlerle, "en iyi
+  tahmin" değil); kredi_mevduat_spread EN İYİ TAHMİN (BEST_EFFORT)
+  grubunda kaldı. `pytest tests/` → 114/114 yeşil (111→114, 3 yeni
+  parametrized test noktası).
+- **Commit'ler:** henüz commit edilmedi. `data/computed.json` canlıda
+  ayrı güncellendi — yedeği
+  `data/backups/computed_20260921_153546_pre_spread_costofrisk_fix.json`.
+
+---
+
+### Dönem 31 — tp_spread/yp_spread paydası düzeltildi (2026-09-21)
+
+- **Tetikleyici:** kullanıcı, PBI'ın kendi "YP Kredi Mevduat Spread'i"
+  ekranının bir fotoğrafını gönderip "veriler hala yanlış" dedi. Gerçek
+  değerler (Haziran 2026, bps): Kuveyt Türk 512, Enpara 1261, TEB 599...
+  — uygulamadaki değerler tutarlı şekilde ~100-250bps YÜKSEK çıkıyordu
+  (ör. KT 640 vs gerçek 512).
+- **Kök neden:** Dönem 29'da payda için TOPLAM TP/YP Mevduat (vadesiz
+  dahil) kullanılmıştı ("ham veride Vadeli bakiye TP/YP kırılımlı yok"
+  diye not düşülmüştü) — bu, maliyeti olduğundan düşük gösterip
+  spread'i şişiriyordu. Enpara'da hata payı neredeyse sıfırdı (vadesiz
+  payı ihmal edilebilir seviyede, dijital banka) — bu ipucuyla asıl
+  sorunun DENOMİNATÖR olduğu teyit edildi.
+- **Çözüm (mevduat bankası):** `Mevduatın Vade Yapısına İlişkin
+  Bilgiler` dipnotunda "Döviz Tevdiat Hesabı" (DTH) + "Kıymetli Maden
+  Depo Hesabı" segmentlerinin TOPLAM'ı bilançodaki YP Mevduat'a ~%1
+  içinde yaklaştığı doğrulandı — bu iki segmentin "Vadesiz" alt kırılımı
+  YP vadesizin iyi bir yaklaşıklığı. TP vadesiz = Toplam(blended, tüm
+  müşteri segmentleri) vadesiz − YP vadesiz. Yeni `ctx.
+  vadeli_mevduat_bakiyesi(banka, tarih, pb)` (`pipeline/lookup.py`)
+  bunu hesaplayıp bilanço TOPLAM bakiyeden çıkarıyor.
+- **Katılım bankası:** `Toplanan Fonların Vade Yapısına İlişkin
+  Bilgiler` dipnotunda YP katılma hesabı segmentleri denendi ama
+  bilançodaki YP Mevduat'ın sadece ~%8'ini kapsıyordu (muhtemelen eksik/
+  kısmi raporlama) — güvenilmez bulunup KATILIM BANKALARI İÇİN TOPLAM
+  bakiye (Dönem 29'daki davranış) KORUNDU. Bilinen, belgelenmiş bir
+  sınır — KT/Albaraka/Türkiye Finans/Ziraat-Vakıf-Emlak Katılım hâlâ
+  olduğundan yüksek spread gösterebilir.
+- **Doğrulama (v29 PBI ekran görüntüsüyle, Haziran 2026, mevduat
+  bankaları):** ortalama sapma ~36bps (önceden ~150-250bps) — Enpara
+  1259 vs 1261, TEB 601 vs 599, Ziraat Bankası 606 vs 594 gibi
+  neredeyse birebir örnekler dahil. Şekerbank tek istisna (~170bps
+  sapma, bilinen veri kalitesi sorunu deseniyle tutarlı). Tam diff:
+  SADECE `tp_spread`/`yp_spread` değişti. `pytest tests/` → 114/114
+  yeşil.
+- **Commit:** `eb42d0e`. `data/computed.json` canlıda ayrı güncellendi —
+  yedeği
+  `data/backups/computed_20260921_155348_pre_tpyp_vadeli_bakiye_fix.json`.
+
+---
+
+### Dönem 32 — Admin paneline Jira tarzı görev panosu (2026-09-22)
+
+- **İstek:** "admin arayüzünde backlog için jira tarzı bir yapı geliştir;
+  yapılacaklar, planlananlar ve yapıldılar elle eklenebilsin, sekmeler
+  arasında taşınabilsin."
+- **Mevcut "Backlog" sekmesinden farkı:** o sekme `whats_new.json`'u
+  okur, yani YAPILMIŞ işlerin sürüm günlüğüdür (salt-okunur). Yeni
+  **Görev Panosu** sekmesi ise henüz yapılmamış işlerin çalışma alanı —
+  bu yüzden verisi kodla değil VERİYLE yaşar: `data/board.json`
+  (git-ignored, `EXPORT_DATA_FILES`'a eklendi, yani sunucu taşıma
+  ZIP'iyle birlikte gider).
+- **Veri modeli:** kartlar sütun sütun LİSTE olarak saklanır
+  (`{"columns": {"yapilacak": [...], "planlanan": [...], "yapildi":
+  [...]}}`). Kartta ayrı bir "sıra" alanı YOK — sıra listenin kendisi;
+  taşıma = kaynaktan çıkar, hedefe `index`'e ekle. Böylece her taşımada
+  yeniden numaralandırma ve ondan doğacak tutarsızlık riski yok.
+- **API** (hepsi `require_admin_access` arkasında): `GET
+  /api/admin/board`, `POST .../cards`, `PUT .../cards/{id}`, `POST
+  .../cards/{id}/move`, `DELETE .../cards/{id}`. Yazma işlemleri
+  `_save_board` ile atomik (tmp → replace), `_load_board` bozuk/eksik
+  dosyada boş panoya düşer.
+- **Arayüz:** üç sütun; kart başlık + açıklama + öncelik (Yüksek/Orta/
+  Düşük, sol kenar rengi) + serbest etiket. Taşıma İKİ yolla: masaüstünde
+  sürükle-bırak (bırakma konumu kartların dikey orta noktasına göre
+  hesaplanır, yani sütun içinde sıralama da yapılabilir), dokunmatikte
+  ←/→ butonları — HTML5 drag&drop mobilde olay üretmediği için buton
+  yolu şart, süsleme değil.
+- **Yan düzeltme:** `escapeHtml` tırnakları kaçırmıyordu
+  (`textContent`→`innerHTML` sadece `& < >` çevirir). Kart başlığı bir
+  `value="…"` özniteliğine yazıldığı için içinde `"` geçen bir başlık
+  özniteliği kapatabilirdi — attribute bağlamı için `escapeAttr`
+  eklendi.
+- **Doğrulama:** canlı tarayıcıda ekle/düzenle/sil/sürükle-bırak/ok-buton
+  akışlarının hepsi denendi, sayfa yenilendikten sonra kalıcılık teyit
+  edildi, mobil genişlikte tek sütuna iniyor. `pytest tests/` → 114/114.
+
+---
+
+### Dönem 33 — 34 maddelik "veriler yanlış" listesi: gerçek PBI çıktısına karşı toplu düzeltme (2026-09-23)
+
+- **Tetikleyici:** kullanıcı 34 maddelik bir liste gönderdi (çoğu "Haziran
+  2026 veriler yanlış"). İlk hipotez Haziran verisinin bozuk olduğuydu
+  (Haziran BDR'leri milyona yuvarlı ayrı bir export'tan geliyor) — ama
+  muhasebe kimlikleri (aktif = pasif, faaliyet geliri toplamı) 27 bankanın
+  hepsinde tuttu, veri sağlam çıktı. Sorun formüllerdeydi; Haziran'da
+  görünmesinin nedeni kullanıcının orada PBI ile kıyaslaması.
+- **KRİTİK BULGU — doğrulama referansı yanlıştı:** önceki dönemlerde
+  "v29 baseline" diye kullanılan `data/computed_backup_2026-08-11.json`
+  kısmen PIPELINE'IN KENDİ ÇIKTISIYDI; `tests/test_baseline_promoted.py`
+  ise doğrudan canlı `computed.json`'la kıyaslıyordu → döngüsel: yanlış
+  bir formül kendi eski değerleriyle "%98 uyumlu" görünüyordu. **Gerçek
+  PBI çıktısı: `datatable_1.xlsx`** (PBI raporunun datatable export'u,
+  227 ölçü adıyla, 2015-03 → 2026-03, grup satırları MEVDUAT/KATILIM/RAKİP
+  dahil) ve ondan üretilmiş `data/computed_datatable_kaynakli_yedek.json`.
+  Bundan sonra formül doğrulaması YALNIZ buna karşı yapılmalı.
+  (`computed_datatable_kaynakli_yedek.json`'daki id eşlemesinde birkaç
+  hata var: kaynak_pacal_maliyet ve personel_ort_aktif — PBI adıyla
+  doğrudan xlsx'ten okumak daha güvenli.)
+- **Düzeltilen formüller** (hepsi PBI'la 2019+ %89–100, KT birebir):
+  - YtD/YtD olması gerekirken TTM/TTM hesaplananlar: Faiz Gideri/Geliri,
+    Komisyon Gid/Gel, Reklam/Net Kâr, Personel/Net Kâr, Net Ücret/Opex.
+  - OPEX tanımı: PBI "Diğer Faaliyet Giderleri (OPEX)" = Personel + Diğer
+    Faaliyet Giderleri (`_opex`). Etkilenenler: diger_faaliyet_giderleri
+    (büyüklük), faaliyet_gid_ort_aktif, net_ucret_operasyonel.
+  - Net NPL Formasyon: pay ×12/ay yıllıklandırılıyor.
+  - Maliyetli Pasif Maliyeti (ve takma adı Kaynağın Paçal Maliyeti):
+    detaylı 9 bileşenli payda (KT %10,8 → %19,8, PBI %19,8).
+  - Cost of Risk: pay Gelir Tablosu toplam karşılığı değil, karşılık
+    giderleri dipnotundaki "Beklenen Kredi Zararı / Özel Karşılıklar"
+    (yeni `ctx.karsilik_gid`).
+  - Tüzel Mevduat (`ctx.tuzel_mevduat`): Resmi Kuruluşlar hariç; Katılım'da
+    yerleşik tüzel kişi ve "Ticari ve Diğer Kur." segmentleri dahil.
+    Tüzel Kredi/Tüzel Mevduat ve (işaretlenmemiş ama bozuk olan) Tüzel
+    Mevduat/Toplam Mevduat birlikte düzeldi.
+  - TP Pasifler/Toplam Pasifler (Özk. Hariç): DAX paydayı düz Toplam
+    Pasifler alıyor (adına rağmen).
+  - Grup 2 Tüzel/Tüzel: payda Tüzel Krediler (kredi kartı hariç).
+  - Düzeltilmiş Maliyet/Gelir: formül PBI değerlerinden geri çıkarıldı —
+    (OPEX + Kredi Değer Düşüş Karşılığı) / Faaliyet Gelirleri, YtD.
+    BASELINE_PASSTHROUGH artık boş.
+- **Grup hesabı (`pipeline/groups.py`):** birçok `_nd_*` banka formülünün
+  eski hâlinde kalmıştı (ör. TP Alınan Krediler İEMK'sız, Maliyet/Gelir
+  eski dar payda + TTM, FGA getirisi basit payda). Hepsi banka tanımıyla
+  hizalandı; RORWA, Düzeltilmiş M/G ve yeni RAV ölçüsü `RATIO_NUM_DEN`'e
+  eklendi (RORWA Katılım grubu basit ortalamaya düşüp TOM Bank yüzünden
+  −0,3 çıkıyordu, PBI 5,3). Spread ve Kredi Mevduat Spread'i grupta artık
+  basit ortalama değil, grup getirisi/maliyetinden bileşik
+  (`COMPOUND_SPREADS`). Mevduat grubunda 21 ölçünün 21'i PBI'la 5/5.
+- **Yeni ölçü:** `ort_rav_ort_ozkaynak` (Ortalama RAV / Ortalama
+  Özkaynaklar, kat). "Ortalama FGA / Ortalama Özkaynaklar" zaten vardı
+  (`faiz_getirili_ozkaynak`, PBI'la birebir) — sadece adı düzeltildi.
+- **Arayüz:** (1) kat birimli oranların değişimi artık bps (fark ×10000,
+  PBI gibi) — önceden % değişimdi. (2) Büyüklük sıralama tablosunda
+  negatif değerlerde bar genişliği negatif çıkıp tarayıcı yok sayıyor, bar
+  önceki ölçünün genişliğinde kalıyordu (Net Ticari Kâr) — |değer|/maxAbs.
+- **Bilerek dokunulmayanlar:** (a) Personel Gid./Ort. Aktif — PBI'daki
+  değer her dönem Faaliyet Gid./Ort. Aktif ile birebir aynı, yani PBI
+  DAX'ında kopyala-yapıştır hatası var gibi; bizimki matematiksel olarak
+  doğru (KT %1,64 vs PBI %3,12), kullanıcıya soruldu. (b) TP Kredi/Toplam
+  Kredi, TP Kredi/TP Kaynak, YP Kredi/YP Altındışı Kaynak — KT'de
+  0,05–0,13 puan fark; PBI'ın [TP/YP Brüt Krediler] tanımı bilinmiyor,
+  DAX gerekiyor. (c) İhtiyaç Kredileri, Maliyet/Gelir, Spread, Kredi
+  Mevduat Spread'i, FGA Getirisi, Tüzel pazar payı, YK Tüzel/Toplam —
+  PBI'la tarihsel olarak birebir; Haziran referans değerleri istendi.
+- **Test:** `test_baseline_promoted.py` gerçek PBI referansına bağlandı
+  (27 ölçü, 2019+). Ölçü sayısı 161 → 162. `pytest` → 128/128.
+- **Veri:** `computed.json` yedeği
+  `data/backups/computed_20260923_152330_pre_pbi_formul_fix.json`; tam
+  diff'te yalnız amaçlanan 17 (banka) + 23 (grup) ölçü değişti, meta'da
+  yalnız available_measures (+1).
+
+---
+
+### Dönem 34 — "İlk 20 Banka" filtresi aktif büyüklüğüne bağlandı; kompozisyon kontrolü (2026-09-23)
+
+- **İstek:** "İlk 20 banka o kalemin ilk 20 bankası değil, güncel aktif
+  büyüklüğe göre ilk 20 banka filtresi olarak uygulanmalı" (ör. TP
+  Aktifler/Toplam Aktifler'de oranı en yüksek 20 banka geliyordu).
+- **Düzeltme:** sıralama tablosunun (BankRanking) "İlk 20" filtresi artık
+  `getFixedTop20(tarih)` — seçili dönemin Toplam Aktifler'ine göre ilk 20
+  (`meta.top20_by_date`, app.py::_rebuild_dynamic_meta) — ile filtreliyor,
+  sıralama ölçüye göre kalıyor. YtD grafiği zaten bu listeyi kullanıyordu;
+  filtre başka kartta yok. Tarayıcıda: iki kart aynı 20 bankayı veriyor.
+- **Kompozisyon şikâyetleri (kredi: Mevduat grubu tüzel/tüketici; gelir:
+  Katılım net faiz):** hem `composition_data` hem ekrandaki yüzdeler PBI
+  datatable'ıyla karşılaştırıldı — 2022'den beri her çeyrekte %0,5 içinde
+  / birebir. Fark bulunamadı; kullanıcıdan karşılaştırdığı PBI ekranı
+  istendi. Olası nedenler: kredi kompozisyonundaki "Tüzel" dilimi leasing,
+  mali kesim ve dış ticaret HARİÇ (PBI tanımı); gelir kompozisyonunda
+  yüzdeler mutlak değer toplamı üzerinden (negatif kalem pozitif dilim).
+
+---
+
+### Dönem 35 — YP Mevduat payı; "Ölçü Oluştur" baştan ele alındı (2026-09-24)
+
+- **YP Mevduat / Toplam Mevduat eklendi** (`yp_mevduat_toplam_mevduat`,
+  Bilanço › Pasifler, TP payının hemen arkasında, sıralama `asc`). 100 −
+  TP olarak değil doğrudan YP / Toplam: eski dönemlerde 12 banka-dönemde
+  TP + YP ≠ Toplam. PBI kalemlerinden hesaplanan oranla 641/643 aynı. TP
+  Mevduat / Toplam Mevduat zaten vardı (PBI ile 135/135). 163 ölçü.
+- **Ölçü Oluştur — bulunan sorunlar:** oranlar her durumda ×100/"%"
+  (Personel/Şube "%1.400" çıkıyordu); akım (YtD) / stok oranında
+  yıllıklandırma yoktu (Mart küçük, Aralık büyük); anlamsız kombinasyonlar
+  (A = B, rasyo/tutar, akım + stok) kaydedilebiliyordu; önizleme, arama,
+  ad çakışma kontrolü, bilgi kartı yoktu; kaynak ölçü silinince özel ölçü
+  sessizce kayboluyordu.
+- **Çözüm:**
+  - Anlam kuralları tek yerde: `pipeline/custom_measure_rules.py` (sunucu
+    doğrular) ve aynısının JS karşılığı `customMeasureSpec` (tarayıcı
+    hesaplar). Oran biçimi: TL/TL → % (veya kat), adet/adet ve
+    rasyo/rasyo → kat (veya %), TL/adet → birim başına bin TL; adet/TL ve
+    rasyo/tutar geçersiz. Fark/toplam: aynı birim, akım + stok yok.
+  - Akım tutar / stok tutar oranında PBI yöntemi: akım son 12 ay (TTM),
+    stok 12 aylık ortalama (`cmNokta`, lookup.ttm_flow/avg_balance ile aynı
+    formül). Doğrulama: "Net Dönem Karı / Toplam Aktifler" özel ölçüsü 27
+    bankanın 27'sinde hazır ROAA ile birebir; Krediler/Personel =
+    Personel Başına Krediler, Krediler/Mevduat = hazır ölçü.
+  - Kayıt: `bicim` alanı (pct/kat), aynı ad engeli (büyük/küçük harf ve
+    boşluk duyarsız, düzenlenen ölçü hariç; katalogdaki adlarla da), sabit
+    0/NaN/inf engeli, ad boşluk normalizasyonu.
+  - Arayüz: aranabilir ölçü seçici (tür/birim/dönem ipucuyla), canlı
+    önizleme (KT + 4 grup, son 4 çeyrek), anında hata açıklaması (Kaydet
+    kapalı), otomatik ad önerisi (60 karaktere sığdırılır), "Dashboard'da
+    göster", listede formül ve kırık referans uyarısı, otomatik bilgi kartı.
+- **Test:** `tests/test_custom_measures.py` (35 test: kurallar + kayıt).
+  UI, gerçek users.py + kural modülüyle çalışan yerel sahte sunucuda uçtan
+  uca denendi (oluştur/düzenle/sil/göster, 14 uç senaryo, mobil).
+  `pytest` → 163/163. Özellik hâlâ yalnız adminlere açık (2026-09-18
+  kararı).
+
+### Dönem 36 — Mobil görünüm baştan elden geçirildi; Dışa Aktar düzeltildi (2026-09-25)
+
+- **Mobil denetimin 16 kartı kapatıldı** (Görev Panosu → Yapıldı). Öne
+  çıkanlar:
+  - Sayfa artık `html` kaydırıyor (`height:100%` + `overflow-x:hidden`
+    body'yi kaydırma kutusuna çeviriyordu → `min-height` + `overflow-x:clip`).
+  - iOS form yakınlaştırması: mobilde alanlar 16 px; yalnız iOS'ta viewport'a
+    `maximum-scale=1` (4 sayfa). Android'e uygulanmaz (parmakla
+    yakınlaştırmayı engellerdi).
+  - Grafikler için `useIsMobileChart()` (matchMedia 560 px): Trend ve Rakip
+    Trend telefonda ayrı viewBox'la (≈1 birim = 1 px) çiziliyor, Trend
+    lejantı grafiğin altında, grafik seçimlerin ÜSTÜNDE. YtD büyüme
+    ≤900 px'te yatay çubuk listesi (27 banka).
+  - `chartPointerProps` + `useTouchDismiss`: parmakla dönem gezinme
+    (`touch-action: pan-y`), dışarı dokununca kapanma.
+  - İç içe dikey kaydırma kaldırıldı (sıralama listesi, Dışa Aktar tablo/
+    ağaç); seçim çipleri yatay 3 sıra.
+  - Seçiciler mobilde tek satırlık özete katlanıyor; arama kutusu hep açık.
+    Arama sonrası sonuç listesinin yeniden açılmaması hatası (masaüstünde de
+    vardı) düzeltildi.
+  - Bilgi kartı mobilde alttan panel, kısa sürüm (ilk cümle + formül +
+    "Daha fazla bilgi"), en fazla %60 ekran.
+  - `BANK_SHORT` kısa banka adları, dokunmatik hedefler (`pointer: coarse`),
+    `noNegZero` ("−0" yazımı), tablet ara düzeni.
+  - Rakip listesi `rakipBankList()` ile `meta.groups['Rakip Bankalar']`'dan
+    (kartlar, trend, dipnot) — önceden koda sabitti.
+  - Admin: başlık "KT Rakip Analizi", sekmeler 2 sütun, pano yana kaydırmalı,
+    Yapıldı sütunu son 8 kart + "Tümünü göster".
+- **Dışa Aktar:** "Banka Grupları" modunda tüm hücreler boştu —
+  `group_data` değerleri `{value: x}` nesnesi, doğrudan okunuyordu
+  (`groupVal` kullanılıyor). Rasyo başlıkları gerçek birimle (%/kat/TL),
+  değerler Türkçe ondalıkla, banka sütunu sabit, mobilde sonuca kaydırma.
+- **Doğrulama:** yerel sahte sunucuda 375 / 768 / 1280 px; canlıda Dışa
+  Aktar hatası önce yeniden üretildi. `pytest` → 163/163.
+
+### Dönem 37 — Asistan, PDF mutabakatı, rol bazlı erişim, hızlanma (2026-09-27 → 2026-09-30, v2.3)
+
+- **Asistan (Qwen 3.5, OpenRouter üzerinden).** `assistant/` paketi:
+  `knowledge.py` (computed.json + catalog + bilgi kartları, mtime ile
+  önbellekli), `tools.py` (salt okunur araçlar: ölçü ara, ölçü bilgisi,
+  banka/grup listesi, değer getir, sırala, ölçü taslağı öner, görünüm aç),
+  `llm.py` (urllib ile SSE; `sk-or-` anahtarı OpenRouter'ı seçer),
+  `service.py` (en fazla 8 tur). Uç: `POST /api/chat` (SSE), `GET
+  /api/chat/status`; kullanıcı başına dakikada 8, günde 300 istek. Anahtar
+  `OPENROUTER_API_KEY` / `QWEN_API_KEY` / `DASHSCOPE_API_KEY` ortam
+  değişkeninde (yerelde gitignore'daki `start.sh`); yoksa asistan butonu
+  hiç görünmez.
+- **Ölçü Oluştur ifade ağacına genişletildi.** Özel ölçü artık `expr`
+  ağacı: `{m}` ölçü, `{k}` sabit, `{op: add|sub|mul|div, l, r}` (en fazla 10
+  yaprak, 6 derinlik). Kurallar `pipeline/custom_measure_rules.py`'de, aynısı
+  frontend'deki `<cm-rules>` bloğunda; ikisi `tests/fixtures/
+  custom_measure_cases.json` ortak senaryolarıyla test ediliyor (JS tarafı
+  node yoksa macOS `jsc` ile). Eski (a op b) kayıtlar otomatik çevriliyor.
+  Ölçü Oluştur tüm üyelere açıldı.
+- **Haziran 2026 PDF'i ile mutabakat.** 136 veri sayfasındaki 10.401 değer
+  dashboard'la karşılaştırıldı (rapor: claude.ai artifact "Rakip Analizi
+  Mutabakatı"). Düzeltilenler:
+  - `m_kredi_mevduat_spread`: maliyet = **kaynak** paçal maliyeti (mevduat
+    değil) — 3/81 → 77/81 eşleşme.
+  - `m_kaynak_pacal_maliyet` = TTM(Mevduata + Kullanılan Kredilere + İhraç
+    Edilen MK'lere verilen faizler) / ort(Mevduat + Alınan Krediler + İhraç
+    Edilen MK) — `kaynak_pacal_num_den`, grup tarafında da aynı pay/payda.
+  - `m_brut_faaliyet_kari`: 'Faaliyet Gelirleri/Giderleri Toplamı' satırı.
+  - Katılım bankalarında TP/YP vadeli bakiye: Mevduat − özel cari (YP'de −
+    kıymetli maden). Mevduat bankalarında sapma sürüyor (açık konu).
+  - `net_faiz_ort_rav`, `gayrinakdi_komisyon_gayrinakdi` grup değerleri
+    basit ortalamaya düşüyordu → `RATIO_NUM_DEN`'e eklendi (SYR/Çekirdek
+    SYR'de PDF de basit ortalama kullanıyor, dokunulmadı).
+  - Gelir kompozisyonunda negatif bileşen işareti korunuyor (`pct = v/Σ|v|`).
+  - 30.09: `faiz_maliyetli_pasif_maliyeti` payı kaynağa verilen faizler
+    (`faiz_maliyetli_pasif_num_den`; repo/diğer faiz hariç) — PDF'le 52/52,
+    `spread` da 52/52. TP/YP kredi ayrımı kur riski tablosundan
+    (`kur_ayrimli_krediler`: YP = 'Kur Riski, Varlıklar (Krediler, Toplam)',
+    dövize endeksli dahil; tablo yoksa bilanço) — üç TP/YP kredi oranı 52/52.
+    TP/YP spread getirisinde bilanço ayrımı korunuyor (kur ayrımı daha uzaktı).
+    Kalan farklar yalnız Rakip grubu tanımından. PDF toplam uyum 9.017 → 9.342.
+  - 30.09: yeni ölçüler `tp_getirili_maliyetli_spread` / `yp_getirili_maliyetli_spread`
+    (kullanıcı formülü: faiz gelirleri/getirili aktif − faiz giderleri/maliyetli
+    pasif, basit fark). TP/YP faiz kırılımı `LookupContext.faiz_tpyp` dipnot
+    tablolarından; zorunlu karşılık, para piyasası ve diğer faiz gelirlerinin
+    TP/YP kırılımı olmadığından TP'ye yazılıyor. Grup: `groups.DIFF_SPREADS`.
+    PDF'teki "TP/YP Kredi Mevduat Spread'i" (tp_spread/yp_spread) bu formülle
+    üretilemiyor (0/52) — o ölçüler değiştirilmedi.
+  - Referans artık Haziran 2026 PDF'i: `test_baseline_promoted`'daki eski
+    spread satırı çıkarıldı, `test_pdf_202606_uyum` eklendi.
+  - PDF'in hatalı olduğu yerler (dashboard doğru): YK 2026-06 KMH-YP kopya
+    satırı, s.119 = s.99 kopyası, s.26 pazar payı sütunu.
+- **Asistana TCMB EVDS (30.09).** `assistant/external/`: `http.py` (urllib + TTL
+  önbellek), `evds.py` (evds3.tcmb.gov.tr/igmevdsms-dis; anahtar `key` başlığında;
+  veri grubu listesi 12 saat önbellekte), `tools.py` (`evds_ara`, `evds_seriler`,
+  `evds_veri`; en fazla 5 seri, 120 satır — fazlasında en yeni satırlar ve "düşük
+  frekans seç" notu). Araçlar yalnız `EVDS_API_KEY` tanımlıysa modele sunulur
+  (`tools.active_specs`); sistem istemine "dış veriyi kaynağıyla ver, BDDK
+  verisiyle karıştırma" kuralı eklendi. EVDS kullanım şartları: kaynak gösterilerek
+  kullanılabilir. evds2 adresi evds3'e yönleniyor.
+- **TÜİK SDMX beklemede (30.09).** github.com/orhoncan/tuik-mcp (MIT) çözümleme
+  fonksiyonları `assistant/external/tuik.py`'ye alındı (bildirim:
+  `THIRD_PARTY_NOTICES.md`), HTTP katmanı urllib ile yeniden yazıldı, anahtar
+  kaydetme aracı alınmadı. Canlı ölçüm: TÜİK sunucusu isteklerin ~%20-30'unda
+  bağlantıyı kabul edip yanıt vermiyor (aynı URL bir denemede 1 sn, diğerinde
+  yanıtsız); `lastNObservations` parametresi hep takılıyor (son N dönem istemci
+  tarafında). Paralel "hedge" istekle 10'da 8 başarı. Kullanıcı kararıyla kapalı:
+  `TUIK_ETKIN=1` + `TUIK_API_KEY` ile açılır.
+- **Karşılaştır sekmesi eklendi, sonra kaldırıldı (2026-09-30, kullanıcı
+  kararı).** 6 panele kadar trend/Anında/kompozisyon paneli ve Banka Tablosu
+  içeriyordu; kod tamamen çıkarıldı (`CompareView`, `BankCompareTable`,
+  `compact`/`stacked` dalları, paylaşılan fare konumu, CSS). Tarayıcılarda
+  kalan `kt_compare_items` anahtarı artık okunmuyor. Trend kontrolleri
+  `TrendControls` bileşeninde kaldı.
+- **İhtiyaç Kredileri ve Serbest Sermaye tanımları (PDF + KT BDR ile).**
+  `m_ihtiyac_kredileri` = İhtiyaç + "Diğer" (tüketici ve personel; KT Haziran
+  2026 BDR: 4.124 + 278 personel + 330 diğer = 4.732, PDF 20/20 banka). Serbest
+  sermaye payından Yatırım Amaçlı Gayrimenkuller de düşülüyor (`serbest_sermaye`,
+  PDF 51/51; fark yalnız bu kalemi büyük olan Garanti/Vakıf/Halk'ta görünüyordu).
+  Not: `scripts/recompute.py` composition/meta yazmıyor — yeniden hesaplamayı
+  `app._run_pipeline_and_save(catalog, force=False, passthrough_only=False)` ile yap.
+- **Tüketici kredisi: kalem toplamı değil Toplam satırı (YK, Garanti, TEB BDR'leriyle).**
+  PBI tüketici kredisini alt kalemleri toplayarak alıyor (PDF 20/20); BDR'ler
+  tablonun Toplam satırını doğruluyor: YK 2026-06 ham veride 'KMH - YP' TP'nin
+  kopyası (+149.296 mn → PDF YK Tüzel Kr./Tüzel Mevduat %232 yerine doğrusu %267),
+  Garanti'de 'KMH-TP (Personel)' 190 mn şablonda ayrı kalem değil, TEB'de ham
+  Tüketici YP 12 (BDR 5). `tuketici_kredileri_kk_haric` = Toplam − kartlar
+  (Grup 2 Tüketici paydası; YK 2026-06 %9,31 → %12,74). Kredi Mevduat Spread'inde
+  PBI'ın "Mevduatın Paçal Maliyeti" aslında kaynağın paçal maliyeti (PDF 52/52;
+  yalnız mevduat maliyetiyle 1/52).
+- **TP/YP Kredi Mevduat Spread'i: vadeli mevduat PDF'ten geri çözüldü.**
+  Bilançodaki YP Mevduat = vade tablosundaki DTH + Kıymetli Maden DH + kur
+  riski tablosundaki Bankalar Mevduatı (13 bankada birebir). Mevduat bankası:
+  YP vadeli = DTH vadeli + YP bankalar − bankalar vadesizi (TCMB hariç), KM
+  dışarıda; TP vadesiz = toplam vadesiz − DTH − KM − aynı bankalar vadesizi.
+  Pay = TP/YP mevduat faizi − KM faizi (`ctx.vadeli_mevduat_faizi`). PDF'le tam
+  eşleşme TP 1→20/35, YP 0→26/35; ortanca 7→1,1 / 15→0,5 bps. Grup değeri
+  COMPOUND_SPREADS'e taşındı (Mevduat Bankaları TP −49 → −254, PDF −248; Rakip
+  farkı yalnız üye tanımından — PDF üyeleriyle −221/410 = PDF). Kalan: bazı
+  bankaların yalnız 2026-06 değeri (Garanti/Vakıf/İş/Halk/Şekerbank/Enpara) —
+  TP ve YP'de eşit ve ters tutarlı bakiye kayması; PBI'daki bir çeyrek verisi
+  farklı olabilir. TP/YP Getirili–Maliyetli Spread de aynı tanımı kullanır.
+- **BDR sağlaması (KT, Garanti, TEB — Haziran 2026).** Her ölçünün okuduğu ham satırlar
+  `TracingLookupContext` ile izlendi (banka başına ~385 girdi) ve BDR metniyle bağlamı
+  (satır adı) kontrol edilerek eşlendi; 2026-06 girdileri ve 2025-06 gelir tablosu birebir.
+  Bulunanlar: `finansal_varliklar()` (nakit BZK düşülmeden, PDF 37→52/52) uygulandı.
+  01.10'da düzeltildi (kullanıcı onayı): `toplam_rav()` = ham satır, kredi riski = RAV − piyasa
+  − operasyonel (≤ 0 ise boş; 2 eski kayıt), Toplam Risk = RAV; `toplam_kredi_kartlari` = kart
+  kredileri Grup 1 + Grup 2; `_vade_dilimi()` katılımda katılım fonu sütunları. SYR ile 'hangisi
+  toplam' algılaması denendi, PBI ile çeliştiği için (QNB 2023-09) bırakıldı. Ölçü formülleri
+  dosyası: `docs/Olcu_Formulleri_2026-10-01.xlsx` (koddan; sözlük + değişiklik günlüğü). Kaynak
+  veri: TEB 'Tüketici YP, Konut' 7 mn = dövize endeksli satırın kopyası (YK KMH deseni).
+  Ham 'Aktiften Silinen' = BDR'de satılan + silinen (satış ve terkin öncesi doğru).
+- **Veri düzeltmeleri (`pipeline/veri_duzeltmeleri.py`).** Ham veride bilinen tutarsızlıklar için belgelenmiş,
+  `LookupContext` veriyi indekslemeden önce uyguladığı tablo; her kayıt beklenen ham değeri taşır (uyuşmazsa
+  dokunulmaz). İlk kayıt: Halk 2025-03 Net Dönem Kârı = 7.051 mn (raporlanan; ham gelir tablosu yeniden
+  düzenlenmiş 6.405'i taşıyordu, özkaynak raporlanan tabandaydı). Kaynak: Halk 31.03.2026 BDR yeniden düzenleme
+  notu (Eylül 2025 TMS 28 özkaynak yöntemi). Halk 2024 gelir/bilanço net kârı ayrışması (3,3–3,8 mlr) açık.
+  BDR sağlaması: Halk Mart BDR'si bin TL, diğerleri milyon TL cinsinden (`ktbdr/audit.py BDRTL=1`).
+- **Rol bazlı erişim (`roles.py`, `data/roles.json`).** Kullanıcı kaydındaki
+  `role` artık bir rol kimliği; izinler rolden gelir. İzinler: `asistan`,
+  `asistan_dis_veri`, `olcu_olustur`, `export_veri`, `export_gorsel`,
+  `admin_veri` (Veri Durumu/Yükleme/Geçmiş, rebuild, yedek), `admin_gruplar`,
+  `admin_kullanicilar` (üyelik + rol tanımları), `admin_proje` (pano, backlog,
+  el kitabı). Hazır roller: Görüntüleyici (izin yok, yeni ve eski 'member'
+  üyeler), Analist, Veri Yöneticisi, Admin (izinleri kilitli). Rol başına
+  asistan günlük soru sınırı (`asistan_gunluk`, 0 = kapalı; dakika sınırı
+  ortak `CHAT_PER_MIN`). Sunucu: `require_perm(...)` (üye uçları),
+  `require_admin_perm(...)` (admin uçları; Basic Auth kökü her izne sahip),
+  `/api/admin/me`, `/api/admin/roles` CRUD. Yetki yükseltme koruması: kimse
+  kendi izinlerini aşan rol atayamaz/tanımlayamaz, daha geniş yetkili
+  kullanıcıyı reddedemez/şifresini sıfırlayamaz, kendi rolünü değiştiremez.
+  Kullanıcı dışa/içe aktarımı `admin_kullanicilar` ister ve `roles.json`'u da
+  taşır. Arayüz: panoda düğmeler `can(...)` ile, admin panelinde sekmeler
+  `data-perm` ile gizlenir; yeni 🔐 Roller sekmesi izin matrisi (satır izin,
+  sütun rol). **Dışa aktarma izinleri yalnız arayüzde** — `/api/data`
+  tarayıcıya tam geldiği için sunucu engelleyemez.
+- **Hızlı kazanımlar.** ⇄ önceki ölçü (Q tuşu); trend grafiklerinde ⬇ PNG
+  (`downloadChartPng`, SVG → canvas 2x).
+- **Görüntü tabanlı PDF (`exportElementPdf`).** `.main-panel` html2canvas
+  ile resme çevrilir, jsPDF ile A4 yatay sayfalara dizilir, doğrudan .pdf
+  iner (kütüphaneler cdnjs'ten ilk PDF'te yüklenir; yüklenemezse
+  `window.print`'e düşer). Ayrıntılar: kesim yeri hiçbir kartı bölmeyen en
+  uzak kenar, yoksa sıralama satırı arası; biraz taşan görünüm tek sayfaya
+  küçültülür; `body.pdf-capture` iç kaydırma kutularını açar; html2canvas
+  `writing-mode` ve `select` çizemediği için kopyada dikey banka adları
+  döndürülmüş SVG metne, açılır kutular düz yazıya çevrilir (`onclone`,
+  `data-pdf-root` ile yalnız yakalanan bölgede). Sayfa başlığı canvas'a
+  yazılıp resim olarak eklenir — jsPDF'in hazır fontlarında ş/ğ/ı yok.
+- **Performans.**
+  - `LookupContext`: pandas MultiIndex `.loc` yerine düz sözlük; NBSP
+    temizliği kategori etiketlerinde. Tam hesaplama 42 sn → 3 sn, bellek
+    tepesi 4,2 GB → 1,0 GB; çıktı birebir aynı (`tests/test_lookup_fast.py`).
+  - `GZipMiddleware` (seviye 6) ve `/`, `/api/data` için ETag + 304
+    (`_revalidated_file`, `Cache-Control: no-cache`). Veri değişmedikçe
+    tekrar açılışta 10 MB inmiyor.
+  - SheetJS yalnız Excel indirilirken yükleniyor (`loadXlsx`); React
+    18.3.1'e sabitlendi.
+- **Tek hesaplama yolu.** Yükleme / ZIP yükleme / rebuild artık
+  `_run_pipeline_and_save()` kullanıyor (grup güncelleme `_write_computed`).
+  ZIP yükleme `banks=` vermediği için computed.json yokken ilk kurulumda
+  boş sonuç hatası veriyordu — düzeldi, testi var.
+- **Kararlar:** Rakip grubu dashboard'daki gibi kalır (PDF'teki
+  Deniz+QNB+TEB'e çekilmedi); pazar payı varsayılan 27 banka, banka
+  listesinde filtre seçiliyken listelenen bankalar içinde; Enpara'nın verisi
+  olan tüm dönemleri gösterilir.
+- **Doğrulama:** yerel sahte sunucuda 375 / 1440 px, açık/koyu tema;
+  gerçek veriyle tam hesaplama karşılaştırması. `pytest` → 291/291.
+
+### Dönem 38 — Denetim turu: güvenlik, e-posta OTP, git/CI, PDF ve Anlık Görünüm (2026-10-24 → 2026-10-25)
+
+Altı rol ajanıyla (`.claude/agents/`) iki tur inceleme yapıldı; bulguların ilk grubu kapatıldı. Ayrıntı: `docs/CHANGELOG.md` (üstteki bölüm).
+
+- **Güvenlik / veri kaybı:** kullanıcı-rol içe/dışa aktarma yalnız tam admin; ZIP yüklemede ham veri silinmek yerine yedeğe taşınır, parquet + `bos_nedenleri.json` yedeklenir, hatada birlikte geri alınır (§9: "çok dosyalı yazımda hepsi birlikte geri alınır").
+- **Rol izinleri:** `baz_reel` / `baz_usd` (Reel TL / USD) izinleri; arayüz düzeyinde.
+- **E-posta OTP:** `otp.py`, varsayılan kapalı (`KT_OTP=true`). Backlog #3'ün (§8) uygulaması; SMTP bilgisi BT'den gelince açılır (`README_dev.md`). Kök admin muaf.
+- **Git/CI:** depo `git init`, `.github/workflows/ci.yml`; commit/push henüz yapılmadı. `data/` yokken ham veriye bağlı testler atlanır → **CI yeşili tam doğrulama değildir** (altın veri fixture'ı backlog'da).
+- **Anlık Görünüm / PDF:** Kuveyt Türk sıra rozeti (sıralama satırında; ayrı kart 2026-11-05'te kaldırıldı), yan yana çeyrek butonları, Kompozisyon kalem sırası; PDF'te Banka Grupları kartı kesilmesi (nth-child → sınıf), Trend grafiğini kartı doldurma, YtD başlık rozetleri, Rakip CAGR mini grafiği, 4800×2700 çözünürlük. **Ders:** PDF stilleri kartları sıra numarasıyla (`nth-child`) seçmesin; yeni kart eklemek aradakileri kaydırıp bozdu.
+- **Ölçü denetimi:** `docs/OLCU_DENETIMI_2026-10-24.md` ve `docs/FORMUL_LISTESI.md`. Açık: NPL paydası (net/brüt), "Rakip" grup tanımı, 52 ölçünün metadata'sı, düşük paydalı oranlar (payda eşiği + `None`), PBI'dan kopya ölçüler.
+- **Rekabet Analizi kategorisi kalktı (2026-11-04):** 39 ölçü asıl kategorisine taşındı, tanıma `rekabet: true` alanıyla; `rekabet_analizi` rol izni korundu (karar: izin kaldırılsın mı sorusu açık). Ayrıntı: CHANGELOG.
+- **Güvenlik sertleştirme (2026-11-05):** denetim günlüğü (`audit.py`), oturum iptali, SRI + betik kaynağı CSP'si, `admin.html` XSS temizleyicisi kapatıldı (CHANGELOG).
+- **Karma tabanlı CSP + `admin.local` kaydı kapatıldı (2026-11-05).**
+- **Rol bazlı ölçü görünürlüğü (2026-11-05):** karar "gösterilecekleri seç" (beyaz liste; sonradan eklenen ölçüler kısıtlı rollerde gizli), kategori gizleme + Rekabet izni korunur (CHANGELOG).
+- **Açık kalanlar (ajan raporları):** `fsync`/atomik yazım ortak yardımcısı, import 500 kenar durumları.
+
+---
+
+## 7. Açık ve bekleyen konular
+
+- **PDF mutabakatında açık kalan (Power BI DAX tanımı gerekiyor):** mevduat
+  bankalarının TP/YP vadeli mevduat bakiyesi (TP/YP spread). En iyi YP
+  yaklaşımı: YP mevduat − DTH vadesiz − kıymetli maden (tümü) − yurtdışı
+  bankalar vadesiz (21/38). Faiz Maliyetli Pasif ve TP/YP kredi 30.09'da
+  çözüldü.
+- **TÜİK entegrasyonu (beklemede, 2026-09-30).** Kod hazır, servis güvenilirliği
+  yetersiz (isteklerin ~%20-30'u yanıtsız). Açmadan önce: TÜİK servisinin
+  kararlılığı yeniden ölçülmeli; kişisel (SMS doğrulamalı) anahtarın çok
+  kullanıcılı sunucuda kullanımı için TÜİK kullanım şartları kontrol edilmeli.
+- **Kütüphaneleri projeden sunmak (ertelendi, 2026-09-29).** React ve
+  SheetJS hâlâ unpkg / cdn.sheetjs.com'dan geliyor; bu siteler kurum ağında
+  engelliyse dashboard açılmaz. Üç dosya (~1,1 MB) `frontend/vendor/`'a
+  alınabilir.
+
+
+- **Site tarafında geçmiş veri eksik (canlı sunucu)** —
+  **DURUM DEĞİŞTİ (2026-09-09):** `/admin/rebuild` yerine (data/raw/ tam
+  değilken riskli, bkz. Dönem 5) `/admin/export-data` ile yerelden
+  paketlenmiş, düzeltmeleri (Dönem 9 dahil) içeren güncel bir
+  `computed.json` kullanıcıya teslim edildi — panelden **İçe Aktar** ile
+  yüklemesi bekleniyor. **İçe aktarmanın gerçekten yapılıp yapılmadığı
+  henüz teyit edilmedi** — bir sonraki oturumda dashboard'da 2026-06-30
+  görünüyor mu diye kontrol edilmeli.
+- **Üçüncü, kullanıcının SSH erişimi olmadığı bir sunucuda veri Eylül
+  2025'te donmuş** — artık SSH gerekmiyor: o sunucunun `/admin` paneline
+  tarayıcıdan girebilen biri, bu makinedeki `/admin`'den indirilecek güncel
+  bir ZIP'i "İçe Aktar" ile yükleyebilir. Şu an aktif bir aksiyon yok,
+  araç hazır.
+- **measures.docx taramasından kalan 1 madde** (veri eksikliği nedeniyle
+  henüz eklenmedi):
+  - *Zorunlu Karşılıklar / Diğer Pasifler / DEK Krediler* — ham BDDK verisinde
+    karşılığı yok veya belirsiz, tahmin yürütülmedi.
+  - ~~*Toplam Kredi Kartları*~~ — **KARAR VERİLDİ (2026-08-19):** DAX
+    formülüne birebir sadık kalınacak (3. terim 2. ile aynı kalır, YP kartlar
+    dahil edilmez) — mevcut implementasyon zaten bu şekilde, değişiklik
+    gerekmiyor. Kapatıldı.
+
+---
+
+## 8. Yol haritası — ne yapılacak
+
+
+### 🔴 Sprint 1 (küçük işler, hemen başlanabilir)
+
+#### 1. What's New butonu
+**Ne:** Topbar'a, son değişiklikleri gösteren bir "Yenilikler" butonu.
+**KARAR (2026-08-19):** İçerik elle güncellenen basit bir liste olacak
+(`data/whats_new.json` gibi) — her önemli değişiklikte kısa, kullanıcı-dostu
+bir not eklenecek.
+**Durum:** ✅ Yapıldı (2026-08-25). `whats_new.json` repo kökünde (git-tracked,
+`data/` değil — `catalog.seed.json` deseniyle aynı), `GET /api/whats-new`
+üzerinden servis ediliyor, dashboard topbar'ında "🆕 Yenilikler" butonu +
+modal (BDR'nin yanından Çıkış'ın sonuna, logo bloğunun hemen öncesine
+taşındı). Yeni bir sürüm notu eklemek için `whats_new.json`'a en üste yeni
+bir `{date, title, items}` girdisi eklenip commit/push yeterli.
+
+**YAZIM KURALI (2026-10-13):** `whats_new.json` yalnızca KULLANICI DENEYİMİYLE ilgili maddeleri içerir (görsel iyileştirmeler, yeni ekran/özellik, Asistan/yapay zekâ araçları, hız, mobil/tablet). Hesaplama düzeltmeleri ("hesaplamalar gözden geçirildi"),
+formül/veri düzeltmeleri, yeni ölçü duyuruları, veri tamamlama, admin paneli değişiklikleri ve "Power BI / PBI ile eşleşti, hizalandı, birebir uyumlu" gibi ifadeler YAZILMAZ; bunlar `docs/CHANGELOG.md`'ye gider.
+
+#### 2. Role-bazlı ölçü erişimi + PDF export (BİRLEŞİK — birbirine bağımlı)
+**KARAR (2026-08-19):** Bu iki madde aslında tek bir özellik seti — ayrı ayrı
+değil, birlikte planlanmalı:
+- **Role sistemi:** Birden fazla özel rol tanımlanacak (basit "yönetici/analist"
+  değil — kaç rol ve isimleri henüz netleşmedi). Her role, **hangi
+  ölçülere/measure'lara erişebileceği ayrı ayrı atanacak** (measure-seviyesinde
+  izin, sadece özet/detay ayrımı değil).
+- **PDF export:** Bir kullanıcı, **kendi rolüne atanmış tüm ölçüleri kalem
+  kalem** (her ölçü kendi çıktısıyla, çoklu-sayfa) PDF olarak indirebilecek.
+**Bağımlılık:** PDF export, role sisteminden ÖNCE ya da onunla BİRLİKTE
+kurulmalı — rolsüz bir "hangi ölçüler dahil olsun" kapsamı tanımlanamaz.
+**Açık soru:** Kaç rol olacak, isimleri ne, hangi rol hangi ölçülere erişsin?
+**Durum:** 📋 Backlog'da, rol listesi netleşince başlanabilir.
+
+#### 3. Passthrough ölçülerin ham veriden türetilmesi (12 ölçü kaldı)
+**Ne:** SYR, Çekirdek SYR, NIM, Düzeltilmiş NIM, Spread, RORWA, Maliyet/Gelir,
+Düzeltilmiş Maliyet/Gelir, Net Faiz Geliri/Ort. Aktifler,
+Gayrinakdi Kredi Komisyonları, Faiz Getirili Aktifler, BZK Sonrası Düzeltilmiş
+NIM — bu 12 ölçü ham BDDK verisinden hesaplanmıyor, eski PowerBI baseline'ından
+taşınıyor (`BASELINE_PASSTHROUGH`). (Gayrinakdi Krediler bu listeden çıktı —
+aşağıya bakın.)
+**Neden önemli:** Baseline sabit olduğu için bu ölçüler **her yeni çeyrekte bir
+dönem geride kalıyor** — 2026Q2 yüklendiği hâlde 12'sinin de son dolu dönemi
+2026-03-31. Kullanıcının "bir dahaki çeyrekte sadece veri yükleyeceğim, formül
+türetmeyi de sistem içinden yapacağız" hedefinin önündeki tek engel bu.
+**Fizibilite (2026-09-08 tespiti):** ham veride karşılıkları VAR —
+`Sermaye Yeterlilik Rasyosu (%)`, `Çekirdek Sermaye Yeterliliği Oranı (%)`,
+`Çekirdek Sermaye Toplamı`, `Net Faiz Geliri/Gideri` gibi kalemler
+`Özkaynak Kalemlerine İlişkin Bilgiler` ve `Gelir Tablosu` tablolarında mevcut.
+**Önerilen yöntem — artık kanıtlanmış bir şablonu var (Dönem 9):** her ölçüyü
+tek tek türet, mevcut baseline değerleriyle **tüm tarihsel (banka, tarih)
+noktalarında** birebir karşılaştır (>%99 eşleşme = formül doğru), sonra
+`MEASURE_FUNCS`'a taşı ve `/admin/rebuild` ile regresyon kilidinden geçir.
+SYR/Çekirdek SYR gibi doğrudan okunabilenlerle başla.
+**Durum:** 📋 Backlog'da — 12/13 kaldı. **KARAR (2026-09-08):** kullanıcı
+"sadece sağlamlaştırma, ölçüler sonra" dedi — genel iş ayrı bir tura
+bırakıldı. **2026-09-09:** kullanıcı `Gayrinakdi Krediler`'i 2026Q2'de boş
+görünce özel olarak istedi; yukarıdaki yöntemle türetildi (bkz. Dönem 9,
+§6) — bu artık kalan 12 ölçü için de aynen izlenebilecek doğrulanmış bir
+örnek.
+
+---
+
+### 🟠 Sprint 2 adayı
+
+#### 3. OTP güvenlik özelliği
+**KARAR (2026-08-19):** Teslimat yöntemi **e-posta**. Mevcut altyapıda SMTP
+entegrasyonu yok — bu, alt-görev olarak eklenmeli (bkz. üyelik sistemi,
+`users.py`/`app.py`).
+**Durum:** 🟡 Kod hazır, **varsayılan kapalı** (2026-10-25, bkz. Dönem 38): `otp.py` + `/api/login/otp`. Canlıya açmak için BT'den SMTP bilgisi (`KT_SMTP_*`, `KT_OTP=true`) ve gönderici adresi için SPF/DKIM gerekir; ayar tablosu `README_dev.md`'de. Kayıt doğrulama ve şifre sıfırlama akışları kapsam dışı.
+
+#### 4. Chat LLM entegrasyonu — TAŞINDI
+2026-08-19'da buraya eklenmiş dar kapsamlı fikir, 2026-09-17'de detaylı bir
+uygulama planına dönüştü ve büyüklüğü nedeniyle **"🟣 Büyük R&D projesi"**
+bölümüne taşındı (bkz. aşağıda madde 6 — "AI Chatbot Asistanı"). O zamanki
+açık soru ("hangi LLM/API, kim ödeyecek?") orada cevaplandı: **Qwen 3.5,
+self-hosted** (dışarıya veri gönderilmiyor, API maliyeti yok).
+
+---
+
+### 🟣 Büyük R&D projesi (kendi spike'ı gerekiyor)
+
+#### 5. PDF fazı — BDR'den otomatik veri, türetilmiş formüller, etiketli erişim
+**Ne:** Projenin bir sonraki büyük fazı. Veri girişi Excel'den **BDR PDF'lerine**
+taşınır, tüm rasyolar sistem içinde türetilir, ölçülere açıklama/içgörü
+baloncukları eklenir, kimin hangi ölçüyü göreceği etiketle belirlenir ve
+kullanıcılar ham kalemlerden kendi formüllerini oluşturabilir.
+
+**KARARLAR (2026-09-08, kullanıcıya sorularak netleştirildi):**
+- Bugüne kadarki Excel verisi kalır; **2026Q3'ten itibaren** çeyreklik
+  güncellemeler tamamen PDF üzerinden.
+- **Arada Excel olmasın** — PDF doğrudan Python veri katmanına yazsın.
+- PDF'leri **sistem otomatik indirsin** (bdr-kisayol panosu).
+- Kullanıcı formülleri **ham BDDK kalemleri** üzerinden; sadece oluşturan
+  görür; **log tutulur**; **şimdilik canlıya alınmayacak** (özellik bayrağı).
+- Baloncuk içeriğini **Claude taslak üretir, kullanıcı onaylar**; metin
+  statik tutulur (her açılışta LLM çağrısı yok).
+- Etiket: bir kullanıcıya **birden fazla**; etiket → **tekil ölçü seçimi**;
+  filtreleme **sunucu tarafında**.
+
+**Fizibilite (doğrulandı):** BDR PDF'lerinde gerçek metin katmanı var (OCR
+gerekmeyebilir); bdr-kisayol panosunda dönem seçimi + doğrudan PDF linkleri
+var; elimizdeki 51 dönemlik doğrulanmış veri, çıkarımı kanıtlamak için altın
+standart olarak kullanılacak.
+
+**Fazlar:** 0) fizibilite kanıtı (karar noktası, %99+ eşleşme eşiği) →
+1) PDF→veri motoru (elle yükleme) → 2) otomatik indirme (insan onay kapısıyla).
+Paralel: 3) 12 passthrough ölçünün türetilmesi (Gayrinakdi Krediler zaten yapıldı, bkz. Dönem 9) · 4) bilgi baloncukları ·
+5) etiket bazlı erişim → 6) kullanıcı formülleri (bayrak arkasında).
+
+**Durum:** 📋 Plan hazır, uygulama başlamadı. Önce FAZ 0 (fizibilite kanıtı)
+çalıştırılmalı — olumlu çıkmadan üzerine sistem kurulmamalı.
+
+---
+
+
+#### PDF fazı — faz detayları
+
+##### FAZ 0 — Fizibilite kanıtı (KARAR NOKTASI)
+**Neden ilk:** PDF çıkarımının güvenilirliği kanıtlanmadan üzerine sistem
+kurmak, projenin en pahalı hatası olur. Finansal veride "çoğunlukla doğru"
+kabul edilemez.
+
+**İşler**
+1. 3 banka × 1 dönem seç (Kuveyt Türk + bir büyük mevduat + bir katılım) —
+   formatları farklı olduğu için çeşitlilik önemli.
+2. PDF'i metin/tablo olarak çıkar (pdfplumber; gerekirse camelot).
+3. Çıkan kalemleri **aynı dönemin mevcut Excel verisiyle satır satır
+   karşılaştır**.
+4. Rapor: kalem eşleşme oranı, birebir tutan değer oranı, tutmayanların
+   nedeni (kalem adı farkı / birim / tablo yapısı / okunamayan sayfa).
+
+**Çıktı:** doğruluk raporu + **git/devam kararı**.
+**Başarı ölçütü:** ana tablolarda (Bilanço, Gelir Tablosu) **%99+ birebir
+eşleşme**. Altındaysa: hangi tabloların güvenilir olduğu belirlenip kapsam
+daraltılır ya da yaklaşım değişir.
+
+---
+
+##### FAZ 1 — PDF → veri motoru (elle yükleme ile)
+**Bağımlılık:** FAZ 0 olumlu sonuçlanmalı.
+
+**İşler**
+1. `pipeline/pdf_ingest.py` — PDF → uzun format DataFrame (mevcut parquet
+   şemasıyla **birebir aynı**: Tarih, Banka Adı, Banka Türü, Tablo Türü,
+   Tablo Adı, Kalem Adı, Para Birimi, Tutar). Böylece alt katmanların
+   (measures, groups, composition) hiçbiri değişmez.
+2. **Kalem eşleme sözlüğü** — BDR'deki kalem adı ile mevcut kalem adları
+   arasında eşleme; NFC normalizasyonu ve NBSP temizliği zorunlu (bu iki
+   tuzağa proje geçmişinde 3 kez düşüldü).
+3. **Kalite kapıları** (yazmadan önce):
+   - Bilanço denkliği: Toplam Aktifler = Toplam Pasifler
+   - Toplam Aktifler bir önceki çeyreğe göre makul aralıkta mı (ör. ±%40)
+   - Beklenen tabloların hepsi bulundu mu
+   - Herhangi biri başarısızsa dosya **işlenmez** — sessizce yanlış veri
+     yazmaktansa "işlenemedi" demek yeğdir.
+4. Admin panele **PDF yükleme** (mevcut Excel yüklemenin yanına).
+5. **Geriye dönük doğrulama:** son 4 çeyrek PDF'ten yeniden üretilip Excel
+   sonucuyla farkları raporlanır.
+
+**Çıktı:** PDF yükleyerek çeyrek güncellemesi yapılabilir hâle gelmek.
+
+---
+
+##### FAZ 2 — Otomatik indirme
+**Bağımlılık:** FAZ 1.
+
+**İşler**
+1. Link toplayıcı: bdr-kisayol panosundan banka + dönem + PDF linki.
+2. İndirme + arşivleme (`data/raw_pdf/<Banka>/<Banka> - GG.AA.YYYY.pdf`).
+3. Zamanlanmış kontrol (çeyrek sonrası periyodik tarama).
+4. **İnsan onayı kapısı:** indirilen PDF otomatik işlenir ama sonuç
+   **doğrudan yayına girmez**; admin panelde "şu bankalar geldi, farklar
+   şunlar, onayla" ekranı. Otomasyon veriyi *hazırlar*, yayına alma kararı
+   insanda kalır.
+5. Eksik/başarısız banka uyarısı (ör. "3 banka henüz yayımlamadı").
+6. **Elle yükleme her zaman yedek yol olarak kalır** — dış kaynak kırılırsa
+   sistem durmasın.
+
+**Risk:** linkler bankaların kendi sitelerine gidiyor; adres/format
+değişiklikleri kaçınılmaz. Bu yüzden indirme katmanı, çıkarım katmanından
+**tamamen ayrı** tutulur — biri kırılınca diğeri çalışmaya devam eder.
+
+---
+
+##### FAZ 3 — kalan 12 passthrough ölçünün türetilmesi
+**Bağımlılık:** yok (Excel verisiyle de yapılabilir), ama PDF fazıyla
+birlikte anlamlı: "dışarıdan hesaplanmış değer almayalım" hedefinin ikinci
+yarısı.
+
+**İşler**
+1. Her ölçü için ham kalem karşılığını bul. Tespit edilenler: PDF/Excel'de
+   `Sermaye Yeterlilik Rasyosu (%)`, `Çekirdek Sermaye Yeterliliği Oranı (%)`,
+   `Çekirdek Sermaye Toplamı`, `Net Faiz Geliri/Gideri` **doğrudan mevcut**.
+2. Türet, sonra **geçmiş dönemlerde baseline değeriyle karşılaştır** — tutuyorsa
+   formül doğrudur.
+3. `BASELINE_PASSTHROUGH`'tan çıkar, `MEASURE_FUNCS`'a taşı.
+4. Doğrudan okunabilenlerle başla (SYR, Çekirdek SYR), sonra türetilmesi
+   gerekenlere geç (NIM, Spread, RORWA).
+
+**Çıktı:** yeni çeyrek yüklendiğinde 160 ölçünün **tamamı** dolu gelir.
+
+---
+
+##### FAZ 4 — Bilgi baloncukları
+**Bağımlılık:** yok — diğer fazlardan bağımsız ilerleyebilir.
+
+**İşler**
+1. `catalog.seed.json`'a ölçü başına yeni alanlar:
+   `tanim` (bu ölçü nedir), `nasil_hesaplanir` (sade formül anlatımı),
+   `icgoru` (yüksek/düşük olması ne anlama gelir, nelere dikkat edilmeli).
+2. Claude 160 ölçü için taslak üretir → kullanıcı düzeltir/onaylar.
+   Metinler dosyada durur, sonradan düzenlenebilir.
+3. UI: ölçü seçicide ve panel başlıklarında ⓘ ikonu → baloncuk.
+4. Admin panelde metin düzenleme ekranı (kod değiştirmeden güncelleme).
+
+**Not:** İçerik **statik** tutulur (her açılışta LLM çağrısı yok) — maliyet
+ve tutarlılık için. İleride dinamik yorum istenirse Chat LLM fazına eklenir.
+
+---
+
+##### FAZ 5 — Etiket bazlı ölçü erişimi
+**Bağımlılık:** yok. FAZ 6'nın önkoşulu.
+
+**İşler**
+1. `data/tags.json` — etiket tanımları: `{ad, aciklama, olculer: [ölçü id]}`.
+2. `users.json`'a `etiketler: []` (bir kullanıcıda birden fazla; görebildiği
+   ölçüler etiketlerinin **birleşimi**).
+3. Admin panelde etiket yönetimi: oluştur/düzenle/sil + **aranabilir ölçü
+   seçici** (160 ölçü içinden tek tek seçim; kategori bazlı toplu seçim
+   kısayolları kolaylık için eklenebilir).
+4. **Sunucu tarafında filtreleme** — `/api/data` ve `/api/catalog` kullanıcının
+   göremeyeceği ölçüleri **hiç göndermez**. Frontend'de gizlemek yeterli
+   değildir; veri ağdan geçmemelidir.
+5. Etiketsiz kullanıcı için varsayılan davranış belirlenir (bkz. açık soru).
+
+---
+
+##### FAZ 6 — Kullanıcı formülleri (canlıya alınmayacak)
+**Bağımlılık:** FAZ 5 (kullanıcının hangi kalemleri kullanabileceği
+etiketiyle sınırlanmalı).
+**Karar:** bu faz geliştirilecek ama **şimdilik canlıya alınmayacak** —
+özellik bayrağı (`KT_FEATURE_USER_FORMULAS`) arkasında kapalı durur.
+
+**İşler**
+1. **Güvenli ifade değerlendirici** — kullanıcı metnini `eval` ile çalıştırmak
+   kesinlikle yasak. AST tabanlı, yalnız izin verilen düğümler (sayı, dört
+   işlem, parantez, kalem referansı) ve sıfıra bölme koruması.
+2. Ham kalem seçici: ~1.891 kalem içinden aranabilir liste (kullanıcının
+   etiketiyle sınırlı).
+3. Kişisel formüller: `data/user_formulas.json` — oluşturan görür.
+4. **Log:** kim, ne zaman, hangi formülü oluşturdu/düzenledi/sildi
+   (denetim izi — kullanıcı isteği).
+5. Önizleme: formül kaydedilmeden önce seçili banka/dönem için sonucu göster.
+
+---
+
+#### PDF fazı — bağımlılık akışı
+
+```
+FAZ 0 (kanıt) ──► FAZ 1 (PDF motoru) ──► FAZ 2 (otomatik indirme)
+                        │
+                        └──► FAZ 3 (kalan 12 ölçünün türetilmesi)   [Excel ile de yapılabilir]
+
+FAZ 4 (baloncuklar)     — bağımsız, paralel ilerleyebilir
+FAZ 5 (etiketler) ──► FAZ 6 (kullanıcı formülleri, bayrak arkasında)
+```
+
+---
+
+#### PDF fazı — riskler
+
+| Risk | Neden ciddi | Azaltım |
+|---|---|---|
+| **Sessiz yanlış çıkarım** | PDF'ten yanlış hücre okunur, kimse fark etmez, yanlış rakamla karar alınır | Excel ile çapraz doğrulama, bilanço denkliği kontrolü, dönemsel sıçrama kontrolü, mevcut regresyon kilidi |
+| **Banka format çeşitliliği** | 27 banka, farklı denetim firmaları, farklı şablonlar | Banka bazlı şablon; başarısızlıkta "işlenemedi" — asla tahmin yürütme |
+| **Solo/Konsolide karışması** | Yanlış rapor tipi tüm seriyi bozar, fark gözle görülmez | Rapor tipi dosya adına ve manifest'e yazılır; mevcut veriyle karşılaştırılarak doğrulanır (bkz. açık soru) |
+| **Otomatik indirme kırılganlığı** | Dış site/link değişir, çeyrek kaçar | İndirme ve çıkarım ayrı katman; elle yükleme her zaman açık; eksik banka uyarısı |
+| **Yayın takvimi dağınıklığı** | Bankalar aynı anda yayımlamaz | Kısmi çeyrek mantığı zaten var (grup toplamları eksik üyede "—" döner) |
+| **Etiket filtresinin atlanması** | Yetkisiz kişi gizli ölçüyü görür | Filtreleme **sunucuda**; frontend'e hiç gönderilmez; testle doğrulanır |
+| **Kullanıcı formülünde kod çalıştırma** | `eval` ile sunucuda kod çalıştırma açığı | AST whitelist, `eval` yok, bayrak arkasında kapalı başlangıç |
+
+---
+
+#### PDF fazı — açık sorular
+
+1. **Solo mu, konsolide mi?** bdr-kisayol her banka için iki rapor sunuyor.
+   Mevcut BDDK verisi hangisine karşılık geliyor? Yanlış seçim tüm seriyi
+   sessizce kaydırır — FAZ 0'da mevcut veriyle karşılaştırılarak
+   kanıtlanmalı.
+2. **Kapsam genişleyecek mi?** Panoda kalkınma/yatırım bankaları da var;
+   sistem şu an 27 banka izliyor. Yeni bankalar eklenecek mi?
+3. **Etiketsiz kullanıcı ne görür?** Hiçbir şey mi (güvenli varsayılan),
+   yoksa temel bir set mi?
+4. **Kullanıcı formülleri ne zaman canlıya alınacak?** Bayrak hangi koşulda
+   açılacak?
+5. **Excel yolu tamamen kapanacak mı?** Karar "2026Q3'ten itibaren PDF" —
+   Excel yükleme ekranı acil durum yedeği olarak kalsın mı?
+
+
+#### 6. AI Chatbot Asistanı (Qwen 3.5 ile veri yorumlama)
+
+**Ne:** Kullanıcı isteği (2026-09-17): "bankalar özelinde veriler ne anlama
+geliyor, bu çeyrekte öne çıkanlar neler tarzında ya da daha önceki verileri
+de bilerek bu verilerle alakalı bir şey sorunca bilgi getirecek bir ai chat
+bot" — Qwen 3.5 dil modeliyle çalışan, dashboard'daki sayısal veriyi doğal
+dilde yorumlayabilen bir sohbet asistanı. Bu madde 2026-08-19'da Sprint
+2'ye "Chat LLM entegrasyonu" olarak eklenmiş dar kapsamlı fikrin detaylı
+uygulama planı — o zamanki Faz 1/Faz 2 aşamalı yaklaşım kararı (önce dar
+kapsamlı, sonra genel amaçlı asistan) ve "kullanıcının role-bazlı ölçü
+erişimine saygı göstermeli" prensibi burada da geçerli (bkz. Sprint 1
+madde 2 ile bağımlılık, açık sorular altında).
+
+**Temel mimari kararlar (neden bu şekilde kurgulanmalı):**
+1. **Model yerel/self-hosted olmalı, hosted API değil.** Veri hassas rakip
+   analiz verisi — üçüncü parti bir API'ye göndermek istenmiyor. Qwen 3.5,
+   vLLM ya da Ollama üzerinden OpenAI-uyumlu bir `/v1/chat/completions`
+   endpoint'i olarak kendi sunucumuzda/ağımızda çalıştırılır.
+2. **RAG değil, tool-calling (fonksiyon çağırma).** Veri zaten yapılandırılmış
+   (banka × ölçü × çeyrek sayısal tablo) — ham metin olarak modele dökmek
+   hem bağlam sınırına takılır hem halüsinasyon (yanlış sayı üretme) riski
+   yaratır. Bunun yerine model, tanımlı fonksiyonları (ör.
+   `get_measure_value`, `get_measure_series`, `compare_banks`,
+   `list_top_movers`) çağırıp GERÇEK sayıyı `pipeline`'dan çeker, sonra
+   yorumlar — sayısal doğruluk garantilenir.
+3. **Mevcut veri erişim katmanı (`pipeline/`) yeniden kullanılır.**
+   `LookupContext`, `bank_data`/`group_data` sözlükleri zaten var —
+   chatbot'un tool'ları bunların ince bir sarmalayıcısı olur, veri
+   hesaplama mantığı TEKRARLANMAZ.
+
+**Önerilen fazlar:**
+- **Faz 0 — Model seçimi ve barındırma (spike):** Qwen 3.5'in hangi boyutu
+  (7B/14B/32B?) kullanılacak, hangi donanımda (GPU var mı, yoksa CPU-only mı)
+  çalışacak, vLLM mi Ollama mı — karar noktası. Basit bir "merhaba dünya"
+  tool-calling testiyle doğrulanır.
+- **Faz 1 — Temel sayısal soru-cevap:** `POST /api/chat` endpoint'i
+  (`require_member` ile korunur, `heavy_op_guard` deseniyle eşzamanlı istek
+  sınırlanabilir — tek GPU'da aynı anda birden fazla üretim istem
+  kuyruklamayı gerektirir), tool tanımları: tekil değer sorgulama, banka
+  karşılaştırma, çoklu-çeyrek serisi. Konuşma geçmişi YOK (stateless, her
+  istek bağımsız) — kapsam küçük tutulur. Frontend'de basit bir chat paneli
+  (mevcut modal deseniyle: `.pw-modal-overlay` + mesaj listesi + input).
+- **Faz 2 — "Bu çeyrekte öne çıkanlar":** Backend'de yeni bir "highlight/
+  outlier" fonksiyonu — verilen çeyrekte tüm ölçüler için QoQ değişimini
+  hesaplayıp en büyük artış/azalışları döndürür (frontend'deki
+  `isValueOutlier` mantığının backend eşdeğeri). Bu bir tool olarak modele
+  sunulur.
+- **Faz 3 — Konuşma geçmişi + bağlamsal farkındalık:** Kullanıcının
+  dashboard'da o an baktığı ölçü/banka/çeyrek otomatik olarak chat
+  bağlamına eklenir ("şu an X ölçüsü, Y çeyreği açık" — kullanıcı tekrar
+  belirtmeden sorabilir). Basit konuşma geçmişi (oturum bazlı, v1'de kalıcı
+  olmayabilir).
+- **Faz 4 (opsiyonel, ileride):** Niteliksel bağlam için hafif bir RAG
+  katmanı — `whats_new.json`, PROJE_EL_KITABI kronolojisi gibi metin
+  içerikleri embed edilip semantik arama ile modele sunulur (ör. "bu ölçü
+  neden değişti" gibi anlatısal sorular için).
+
+**Açık sorular (karara bağlanmadan başlanamaz):**
+1. Qwen 3.5'in hangi boyutu, hangi donanımda? Mevcut sunucuda GPU var mı?
+2. vLLM mi Ollama mı — throughput mu kolaylık mı öncelik?
+3. Chat, ayrı bir sekme mi (MODES dizisine eklenir — "Görünümlerim"in
+   gizlendiği/eklendiği desenle aynı) yoksa floating widget mı?
+4. Konuşma geçmişi kalıcı olacak mı (`data/chat_history/` gibi) yoksa
+   oturum bazlı mı kalacak?
+5. Rol bazlı ölçü erişimi (yukarıdaki madde 2, Sprint 2) hayata geçerse
+   chatbot'u da kapsayacak mı — yoksa tüm üyeler tüm ölçüleri chat
+   üzerinden de mi sorgulayabilecek?
+
+**Durum:** 💡 Fikir aşaması, plan hazır — Faz 0 (model/donanım kararı) ile
+başlanmalı.
+
+---
+
+### 🔵 v2'ye ertelenmiş konular (daha önce karara bağlanmış, unutulmasın)
+
+#### 7. Konfigüre edilebilir odak banka
+**Ne:** Kuveyt Türk yerine başka bir bankayı "odak" yapabilme.
+**Neden ertelendi:** Grup katmanının kırılgan geçmişi (bkz. Dönem 2'deki
+grup agregasyon bug'ları) nedeniyle riskli bulundu.
+**Uygulama haritası hazır** (Claude'un hafıza notunda) — v2'de sıfırdan
+araştırma gerekmeyecek: `KT_NAME` sabiti `DATA.meta.odak_banka`'ya
+bağlanacak, `PROTECTED_GROUPS` ve varsayılan grup üyeliği odağa göre
+güncellenecek.
+**Durum:** ⏸️ v2'ye ertelendi.
+
+#### 8. Screenshot / PDF-öncesi PNG indirme
+**Ne:** Bulunduğun görünümü PNG olarak indirme butonu.
+**Neden ertelendi:** Kullanıcı v2'de yapmaya karar verdi.
+**Durum:** ⏸️ Kod `feature/v2-screenshot` branch'inde hazır (2 commit),
+Firefox'ta `toBlob` SecurityError sorunu vardı, son fix canlı doğrulanmadı —
+v2'de ya bu fix'i test et ya da native `getDisplayMedia`'ya geç.
+
+---
+
+### ⚙️ Süreç
+
+- **Backlog dokümanı:** ✅ Bu dosya (son güncelleme 2026-09-08).
+- **Otomatik güncelleme talimatı (2026-08-25):** Bundan sonra yapılan her
+  büyük işlemde bu dosya VE görsel HTML artifact'ı sorulmadan güncellenecek.
+- **Zaman planı:** 📋 Sprint 1 tamamlanınca tarih hedefleri eklenecek.
+- **Sprint oluşturma:** ✅ Sprint 1 yukarıda tanımlı. Rasyonet otomasyonu
+  boyutu nedeniyle sprint'e alınmadı, önce spike gerekiyor.
+
+---
+
+## 9. Kararlar günlüğü — neden böyle yapıldı
+
+Bir şeyi değiştirmeden önce buraya bakın; çoğu "tuhaf" görünen tercih, bedeli
+ödenmiş bir dersin sonucudur.
+
+| Karar | Gerekçe |
+|---|---|
+| **`data/` git'te değil** | Git-push-to-deploy kurulumunda sunucudaki `git pull`, tracked bir veri dosyasını eski kopyayla ezip canlı veriyi geri alabilirdi. Bedeli: kod ve veri ayrı taşınır (§4.3). |
+| **Ham xlsx arşivi kalıcı, dokunulmaz** | Her şey yeniden hesaplanabilir olmalı. Yeni ölçü eklemek ham veriye dokunmaz. |
+| **Frontend hesaplama yapmaz** | Formül değişikliği tek yerde (pipeline) olur, frontend'e dokunulmaz; tutarsızlık riski kalkar. |
+| **Grup, eksik üyede `None` döner** | Yanıltıcı küçük toplam üretmektense "veri yok" demek. 2026-08-11'de tam tersi davranış yanlış grup toplamları üretiyordu. |
+| **Grup rasyoları ağırlıklı ortalama** | Basit ortalama, büyük bankayı küçükle eşitleyip sektör gerçeğini bozar. |
+| **Tek worker** | Kilitler ve rate-limit in-process; çoklu worker bunları sessizce devre dışı bırakırdı. |
+| **`catalog.seed.json` + runtime `catalog.json`** | Config (ölçüler) kodla, gruplar (admin panelden düzenlenen) veriyle gelmeli. Seed mimarisi ikisini ayırıp kod↔config uyumsuzluğunu bitirdi. |
+| **Regresyon kilidi (2026-09-08)** | "Sonuç boş mu" kontrolü yetmiyordu: 51 dönem → 1 döneme düşen kaza bu kontrolü geçmişti. Artık küçülme reddediliyor, bilinçliyse elle zorlanıyor. |
+| **Sunucu taşıma paketi manifest'li** | "Hangi zip güncel" sorusu insan hafızasına kalınca, bir sunucuda Eylül 2025'te donmuş veri yayına çıktı. Manifest bunu görünür kılıyor. |
+| **Otomasyon veriyi hazırlar, yayına insan alır** | PDF fazında da aynı ilke: indirme otomatik, yayın kararı admin onayında (§8, FAZ 2). |
+| **12 ölçü hâlâ passthrough** (2026-09-09'a kadar 13'tü) | Ham veriden türetilmeleri doğrulama gerektiriyor; yanlış formülle "dolu ama hatalı" veri üretmektense bilinen bir boşluk bırakıldı. `gayrinakdi_krediler` doğrulanıp (1057 noktadan 1053 tam eşleşme) raw'a taşındı — geri kalan 12'si için de aynı doğrulama süreci önce (bkz. Dönem 9, §8). |
+| **Esas referans Haziran 2026 PDF'i** (2026-09-27) | `datatable_1.xlsx` eski spread tanımını taşıyordu; PDF Power BI'ın güncel çıktısı. Rakip grubu ise PDF'e çekilmedi, dashboard'daki tanım korundu. |
+| **Pazar payı evreni filtreye bağlı** (2026-09-27) | Varsayılan 27 banka; banka listesinde Katılım/Mevduat/Rakip/İlk 20 seçiliyken o listenin kendi içindeki pay — PDF ilk 20'ye göre veriyordu, kullanıcı ikisini de istedi. |
+| **Roller kutucuklu, izinler sabit listeden** (2026-09-30) | Kullanıcı özel rol + izin kutucuklarını seçti; izin anahtarları kodda sabit (`roles.IZINLER`) çünkü her biri bir uç noktaya/düğmeye bağlı. Mevcut üyeler Görüntüleyici'ye düştü (kullanıcı kararı) — admin rol vermeli. Dışa aktarma kısıtı arayüz düzeyinde; gerçek veri kısıtı gerekirse `/api/data` rol bazlı süzülmeli. |
+| **Çok dosyalı yazımda hepsi birlikte yedeklenir/geri alınır** (2026-10-25) | ZIP yüklemede yalnız `computed.json` yedeklenince, pipeline hatasında "ham eski, parquet yeni" tutarsızlığı oluşuyordu. Ham klasörler (silinmez, taşınır), `veriler.parquet` ve `bos_nedenleri.json` birlikte geri alınır; geri alma yalnız işlemin yazdığı dosyaları siler. |
+| **Kullanıcı/rol taşıma yalnız tam admin** (2026-10-25) | Parola hash'i ve rol tanımı taşır; içe aktarılan içerik yazılmadan doğrulanmadığı için kısmi yetki, kendine Admin rolü vermeye yolu açardı. |
+| **OTP kodları bellekte, kök admin muaf** (2026-10-25) | Tek worker varsayımıyla diske yazmadan basit ve güvenli; yeniden başlatmada bekleyen kodlar düşer. `@admin.local` gerçek posta kutusu olmadığı için muaf: SMTP bozulsa da break-glass girişi kalır. |
+| **PDF stilleri kartları sınıfla seçer, `nth-child` ile değil** (2026-10-25) | Sağ sütuna yeni kart eklemek `nth-child` numaralarını kaydırıp Banka Grupları kartını sıkıştırdı, değerleri kesildi. |
+| **Bozuk "Toplam" satırına karşı alt kalem toplamı yedeği** (2026-09-09) | KT 2020-06-30'da BDDK ham verisinin kendisinde bir "Toplam" kalemi (-2,15 trilyon) fiziksel olarak imkânsızdı; alt kalemler toplamı doğruydu. Negatif/anlamsız bir toplam görülürse alt kalemlere düşmek, tek bozuk satırın tüm tarihi bozmasını önlüyor — ham BDDK verisi %100 güvenilir değil, formüllerde bu ihtimal göz önünde tutulmalı. |
+
+---
+
+## 10. Referans dokümanlar
+
+| Dosya | Ne zaman bakılır |
+|---|---|
+| `docs/MEASURES.md` | Bir ölçünün formülünü/tanımını ararken (445 satır, DAX eşdeğerleriyle) |
+| `docs/MEASURE_LISTESI.md` | 160 ölçünün hızlı listesi |
+| `docs/EXTENDING.md` | Yeni ölçü, banka, grup veya kompozisyon eklerken — adım adım |
+| `docs/ARCHITECTURE.md` | Storage şeması ve pipeline modüllerinin detayı |
+| `docs/DATA_MIGRATION.md` | Sunucu göçü / veri paketi üretimi |
+| `docs/CHANGELOG.md` | Sürüm geçmişi (v17 → v29 dönemi) |
+| `docs/backlog-visual.html` | Bu dosyanın görsel özeti (yayınlanmış sayfa) |
+| `docs/pdf-fazi-gorsel.html` | PDF fazının görsel yol haritası |
+
+**Kod içindeki yorumlar birincil kaynaktır.** `app.py` ve `pipeline/*.py`
+içinde her kritik kararın yanında tarihli açıklama vardır (ör. "2026-08-11
+düzeltmesi: …"). Bir satırın neden öyle yazıldığını merak ettiğinizde önce
+oradaki yoruma bakın.

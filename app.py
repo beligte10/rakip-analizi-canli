@@ -1,0 +1,3616 @@
+"""
+KT Stratejik Kokpit — Web Sunucusu
+=============================================
+FastAPI tabanlı, tamamen yerel çalışan uygulama.
+
+Mimari:
+- Uygulama kodu ve veri aynı repo içinde birlikte yaşar.
+- data/        → kalıcı veri klasörü (repo içinde)
+                  ├── raw/                    yüklenmiş xlsx'ler
+                  ├── veriler.parquet         pipeline parquet
+                  ├── computed.json           hesaplanmış JSON
+                  ├── catalog.json            measure & banka metadata
+                  ├── upload_history.json     upload geçmişi log
+                  ├── users.json              üyelik başvuruları/hesapları
+                  └── .session_secret         oturum çerez imzalama anahtarı
+
+İki AYRI yetki seviyesi (2026-08-12'den itibaren):
+- ADMIN (HTTP Basic Auth, KT_USERNAME/KT_PASSWORD) — upload/rebuild/coverage
+  + üyelik başvurularını onaylama/reddetme. TEK hesap, değişmedi.
+- ÜYE (users.json + oturum çerezi) — sadece dashboard'u (Cockpit) görüntüler.
+  Kayıt herkese açık ama 'pending' başlar; admin onaylamadan giriş yapılamaz.
+
+Endpoint'ler:
+- GET  /                          → frontend HTML
+- GET  /admin                     → admin paneli HTML (Basic Auth)
+- GET  /login , /signup           → üyelik giriş/kayıt HTML
+- GET  /healthz                   → liveness (auth-free)
+- POST /api/signup                → yeni üyelik başvurusu (pending)
+- POST /api/login , /api/logout   → oturum aç/kapat
+- GET  /api/me                    → oturumdaki üyenin bilgisi
+- GET  /api/data , /api/catalog   → computed.json/catalog.json (üye girişi gerekir)
+- GET  /api/version                → metadata
+- GET  /api/admin/coverage         → banka × çeyrek var/yok matrisi
+- GET  /api/admin/history          → son upload'lar
+- GET  /api/admin/users            → üyelik başvuruları listesi
+- POST /api/admin/users/{id}/approve|reject → üyelik onayı/reddi
+- GET  /api/admin/board            → görev panosu (kanban) kartları
+- POST/PUT/DELETE /api/admin/board/cards[/{id}[/move]] → kart ekle/düzenle/taşı/sil
+- POST /admin/upload                → xlsx yükle, pipeline çalıştır
+
+ENV vars (opsiyonel, hiçbiri zorunlu değil):
+- KT_USERNAME    (default: faruk)     — admin panel kullanıcı adı
+- KT_PASSWORD    (default: faruk123)  — admin panel şifresi
+- DATA_DIR       (default: ./data)    — veri klasörünün yolu
+- PORT           (default: 8000)      — sunucu portu
+"""
+from __future__ import annotations
+import os
+import io
+import json
+import uuid
+import shutil
+import secrets
+import zipfile
+import threading
+import time
+import traceback
+import subprocess
+import multiprocessing
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, status, Depends
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.middleware.sessions import SessionMiddleware
+import security
+from starlette.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel
+
+import users as users_mod
+import roles as roles_mod
+import audit
+import otp
+from pipeline.measure_info import get_measure_info_cards
+from pipeline import custom_measure_rules
+from pipeline.focus import apply_focus_bank, focus_of, rakipleri_normalle, set_rakipler, RAKIP_GRUBU
+from pipeline.banka_adlari import BANKA_AD_ESLEME, kanonik as kanonik_banka
+from assistant import llm as assistant_llm, service as assistant_service
+from assistant import anahtarlar as asistan_anahtarlar
+from assistant.knowledge import Store as AssistantStore
+
+
+# ============================================================
+# Konfigürasyon
+# ============================================================
+APP_ROOT = Path(__file__).parent.resolve()
+FRONTEND_DIR = APP_ROOT / 'frontend'
+
+# Tüm veri tek bir yerel klasörde yaşar — repo'nun kendi data/ klasörü
+DATA_DIR = Path(os.environ.get('DATA_DIR', APP_ROOT / 'data')).resolve()
+DATA_RAW = DATA_DIR / 'raw'
+DATA_PARQUET = DATA_DIR / 'veriler.parquet'
+DATA_COMPUTED = DATA_DIR / 'computed.json'
+DATA_BOS_NEDEN = DATA_DIR / 'bos_nedenleri.json'   # Rekabet ölçülerinde boş hücrelerin nedenleri (pipeline/bos_nedenleri.py)
+DATA_BACKUPS = DATA_DIR / 'backups'   # rebuild/upload öncesi computed.json yedekleri (denetim #10)
+DATA_CATALOG = DATA_DIR / 'catalog.json'
+# Config kaynağı (git-tracked, repo kökünde — data/ volume'unun DIŞINDA, deploy'da
+# gölgelenmez). Ölçü/kompozisyon/banka tanımları buradan gelir; startup'ta canlı
+# data/catalog.json'a merge edilir (runtime `groups` korunarak). Bkz.
+# _sync_catalog_from_seed (2026-08-15 denetimi #7 — kod↔config uyumsuzluğu).
+SEED_CATALOG = APP_ROOT / 'catalog.seed.json'
+# Ölçü bilgi kartları (Tanım/Formül/Kaynak vb.) — git-tracked doküman,
+# frontend ÖLÇÜ seçicisinin yanındaki info kartı buradan parse edilir.
+MEASURE_INFO_MD = APP_ROOT / 'docs' / 'olcu_info_kartlari.md'
+DATA_HISTORY = DATA_DIR / 'upload_history.json'
+DATA_USERS = DATA_DIR / 'users.json'
+DATA_DENETIM = DATA_DIR / 'denetim.jsonl'   # yönetici işlemleri denetim günlüğü (audit.py)
+# Rol tanımları ve izinleri (2026-09-30) — bkz. roles.py.
+DATA_ROLES = DATA_DIR / 'roles.json'
+# Asistan API anahtarları (admin panelden, 2026-10-07) — sır: export paketine girmez.
+DATA_ASISTAN_ANAHTAR = DATA_DIR / '.asistan_anahtarlari.json'
+# Görev panosu (Jira tarzı kanban) — admin panelden elle girilen yapılacaklar.
+# whats_new.json'dan (yapılmış işlerin SÜRÜM günlüğü) ayrıdır: bu, henüz
+# yapılmamış/planlanan işlerin çalışma alanı, o yüzden kodla değil veriyle
+# birlikte (DATA_DIR) yaşar ve export/import paketine dahil edilir.
+DATA_BOARD = DATA_DIR / 'board.json'
+SESSION_SECRET_PATH = DATA_DIR / '.session_secret'
+
+# Auth — admin (mevcut, tek hesap, upload/rebuild/coverage kontrolü)
+# 2026-10-04: kaynak kodda tahmin edilebilir varsayılan şifre YOK. KT_PASSWORD yoksa (ya da bilinen zayıf bir
+# değerse) production'da başlatma reddedilir, geliştirmede bu süreç için rastgele şifre üretilip loga yazılır.
+
+# Ultra admin (2026-08-15): TEK bir hesaba özel, en üst düzey admin. Sıradan
+# adminler bu hesabı üye listesinde GÖREMEZ ve üzerinde işlem yapamaz. Kimlik
+# env değişkeninden gelir (start.sh::KT_ULTRA_ADMIN_EMAIL) — admin panelinden
+# görülemez/değiştirilemez, kimse UI'dan kendine ultra rolü veremez. Boşsa
+# özellik pasiftir (kimse gizlenmez).
+ULTRA_ADMIN_EMAIL = os.environ.get('KT_ULTRA_ADMIN_EMAIL', '').strip().lower()
+
+# Production bayrağı (2026-08-15 denetimi #4/#6). Canlıda start.sh/sunucu ortamında
+# KT_PRODUCTION=true set edilir. Etkileri:
+#  - Oturum çerezi Secure olur (https_only) — TLS proxy arkasında tarayıcı↔proxy
+#    HTTPS olduğundan doğru; lokal HTTP dev'de False kalmalı (yoksa çerez gitmez).
+#  - /docs, /redoc, /openapi.json kapatılır (API şeması sızıntısını önler).
+KT_PRODUCTION = os.environ.get('KT_PRODUCTION', '').strip().lower() in ('1', 'true', 'yes', 'on')
+USERNAME, PASSWORD, _SIFRE_RASTGELE = security.kimlik_bilgisi_coz(
+    os.environ.get('KT_USERNAME'), os.environ.get('KT_PASSWORD'), KT_PRODUCTION)
+if _SIFRE_RASTGELE and multiprocessing.current_process().name == 'MainProcess':
+    print('[güvenlik] KT_PASSWORD tanımlı değil/zayıf: bu oturum için rastgele admin şifresi üretildi → '
+          f'{USERNAME} / {PASSWORD}  (kalıcı için start.sh içinde KT_PASSWORD tanımlayın)')
+
+# auto_error=False: credentials verilmemişse (kullanıcı Basic Auth yerine
+# session ile geliyorsa) 401 fırlatmadan None döner — require_admin_access
+# bu durumda session/rol kontrolüne geçer (bkz. aşağı).
+security_optional = HTTPBasic(auto_error=False)
+
+# Hız sınırları (2026-10-04): e-posta bazlı giriş sınırına (aşağıda) ek olarak IP bazlı sınırlar —
+# farklı e-postalarla parola püskürtme, Basic Auth (admin) kaba kuvveti ve kayıt (signup) seli.
+# TLS proxy arkasında IP, X-Forwarded-For'un proxy'nin eklediği son girdisinden alınır (security.client_ip).
+_RL_BASIC = security.RateLimiter(10, 300)      # admin Basic Auth: 5 dk'da 10 başarısız deneme / IP
+_RL_LOGIN_IP = security.RateLimiter(30, 300)   # üye girişi: 5 dk'da 30 başarısız deneme / IP
+_RL_SIGNUP_IP = security.RateLimiter(5, 3600)  # kayıt başvurusu: saatte 5 / IP
+
+
+def _ip(request: Request) -> str:
+    return security.client_ip(request, KT_PRODUCTION)
+
+
+def _basic_auth_ok(credentials: Optional[HTTPBasicCredentials]) -> bool:
+    if credentials is None:
+        return False
+    # bytes ile karşılaştır: ASCII dışı karakterli kimlik bilgisi compare_digest'te TypeError (500) üretiyordu
+    valid_user = secrets.compare_digest(credentials.username.encode('utf-8'), USERNAME.encode('utf-8'))
+    valid_pass = secrets.compare_digest(credentials.password.encode('utf-8'), PASSWORD.encode('utf-8'))
+    return valid_user and valid_pass
+
+
+def _session_user(request: Request) -> Optional[dict]:
+    user_id = request.session.get('user_id')
+    if not user_id:
+        return None
+    user = users_mod.get_user_by_id(DATA_USERS, user_id)
+    if not user or user['status'] != 'approved':
+        return None
+    # Şifre/rol değişimi ve reddetme sonrası eski oturumlar düşer (users.oturum_iptal); eski çerezlerde `sv` yoksa 0 sayılır.
+    if int(request.session.get('sv') or 0) != int(user.get('oturum_surumu') or 0):
+        return None
+    return user
+
+
+def user_role(user: Optional[dict]) -> dict:
+    """Kullanıcının rolü (izinler + asistan günlük sınırı). Basic Auth kökü
+    için user=None → Admin rolü."""
+    return roles_mod.get_role(DATA_ROLES, user.get('role') if user else roles_mod.ADMIN_ROL)
+
+
+def user_perms(user: Optional[dict]) -> set:
+    """Kullanıcının YETKİ izinleri ('gizle:<kategori>' kısıtları hariç, bkz. roles.yetki_izinleri)."""
+    return set(roles_mod.yetki_izinleri(user_role(user)['izinler']))
+
+
+def _admin_identity(request: Request, credentials: Optional[HTTPBasicCredentials],
+                    perms_needed: tuple) -> str:
+    """Rol bazlı admin erişimi (2026-09-30). İki yoldan biri:
+    1. HTTP Basic Auth (KT_USERNAME/KT_PASSWORD) — her zaman tüm izinler.
+    2. Onaylı üyelik oturumu + rolünde istenen izin(ler)den biri.
+    perms_needed boşsa herhangi bir admin_* izni yeter (admin sayfası).
+    Döner: kimlik (Basic Auth kullanıcı adı ya da oturum e-postası)."""
+    if credentials is not None:
+        ip = _ip(request)
+        if not _RL_BASIC.izinli(ip):
+            raise HTTPException(status_code=429, detail='Çok fazla başarısız admin girişi. Birkaç dakika sonra tekrar deneyin.')
+        if _basic_auth_ok(credentials):
+            _RL_BASIC.sifirla(ip)
+            return credentials.username
+        _RL_BASIC.hata(ip)
+    user = _session_user(request)
+    if user:
+        perms = user_perms(user)
+        need = perms_needed or tuple(roles_mod.ADMIN_IZINLERI)
+        if any(p in perms for p in need):
+            return user['email']
+        raise HTTPException(status_code=403, detail='Bu işlem için rolünüzde yetki yok')
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail='Admin yetkisi gerekiyor',
+        headers={'WWW-Authenticate': 'Basic'},
+    )
+
+
+def require_admin_perm(*perms: str):
+    """Admin paneli uçları için izin kontrolü: Depends(require_admin_perm('admin_veri'))."""
+    def dep(request: Request,
+            credentials: Optional[HTTPBasicCredentials] = Depends(security_optional)) -> str:
+        kimlik = _admin_identity(request, credentials, perms)
+        try:
+            request.state.denetim_kimlik = kimlik   # ara katman işlem sonucunu bu kimlikle denetim günlüğüne yazar
+        except AttributeError:                  # birim testlerindeki sahte istekte state yok
+            pass
+        return kimlik
+    return dep
+
+
+def require_admin_access(
+    request: Request,
+    credentials: Optional[HTTPBasicCredentials] = Depends(security_optional),
+) -> str:
+    """Admin sayfasına giriş: Basic Auth ya da en az bir admin_* izni olan rol."""
+    return _admin_identity(request, credentials, ())
+
+
+def identity_perms(identity: str) -> set:
+    """_admin_identity'nin döndürdüğü kimliğin izinleri (Basic Auth kökü: hepsi)."""
+    if identity == USERNAME:
+        return set(roles_mod.all_permissions())
+    user = users_mod.get_user_by_email(DATA_USERS, identity)
+    return user_perms(user) if user else set()
+
+
+def require_member(request: Request) -> dict:
+    """
+    Üyelik oturumu kontrolü (2026-08-12 eklendi) — dashboard'u sadece admin
+    tarafından ONAYLANMIŞ üyeler görebilir. Pano verisini okumak her onaylı
+    üyeye açıktır; asistan, ölçü oluşturma gibi özellikler rolün izinlerine
+    bağlıdır (require_perm, 2026-09-30).
+    """
+    user_id = request.session.get('user_id')
+    if not user_id:
+        raise HTTPException(status_code=401, detail='Giriş yapmalısınız')
+    user = users_mod.get_user_by_id(DATA_USERS, user_id)
+    if not user or user['status'] != 'approved':
+        request.session.clear()
+        raise HTTPException(status_code=401, detail='Oturum geçersiz — tekrar giriş yapın')
+    return user
+
+
+def require_perm(perm: str):
+    """Üye uçları için izin kontrolü: Depends(require_perm('asistan'))."""
+    def dep(user: dict = Depends(require_member)) -> dict:
+        if perm not in user_perms(user):
+            raise HTTPException(status_code=403, detail='Bu özellik rolünüzde açık değil')
+        return user
+    return dep
+
+
+def is_ultra_admin(identity: Optional[str]) -> bool:
+    """require_admin_access'in döndürdüğü kimlik (Basic Auth username ya da
+    session email) ultra admin mi? (2026-08-15)
+
+    - Basic Auth kök hesabı (USERNAME) HER ZAMAN ultra sayılır: sunucunun kök
+      kimliğidir ve varsayılan ultra hesap (f'{USERNAME}@admin.local') ondan
+      türer — kendi hesabını kendinden gizlemek anlamsız olurdu.
+    - Ayrıca KT_ULTRA_ADMIN_EMAIL ile eşleşen session hesabı ultra'dır.
+    ULTRA_ADMIN_EMAIL boşsa yalnızca Basic Auth kökü ultra olur."""
+    if not identity:
+        return False
+    ident = identity.strip().lower()
+    if ident == USERNAME.strip().lower():
+        return True
+    return bool(ULTRA_ADMIN_EMAIL) and ident == ULTRA_ADMIN_EMAIL
+
+
+def _assert_can_target_user(user_id: int, requester_identity: str) -> None:
+    """Sıradan admin, ultra hesabı HEDEF ALAMAZ (onay/red/rol). Gizli olduğu
+    için varlığını sızdırmamak adına 404 döndürülür — 403 değil."""
+    if not ULTRA_ADMIN_EMAIL or is_ultra_admin(requester_identity):
+        return
+    target = users_mod.get_user_by_id(DATA_USERS, user_id)
+    if target and target.get('email', '').strip().lower() == ULTRA_ADMIN_EMAIL:
+        raise HTTPException(status_code=404, detail='Kullanıcı bulunamadı')
+
+
+# Ağır işlem (upload/rebuild) serileştirme kilidi (2026-08-15). Bu 3 endpoint
+# CPU-ağır (compute_all/rebuild_parquet, dakikalarca) ve artık `async def`
+# DEĞİL, `def` — FastAPI bunları threadpool'da çalıştırır, böylece event
+# loop'u BLOKE ETMEZ (eskiden `async def` içindeki senkron iş tüm sunucuyu
+# donduruyordu). threadpool'da paralel çalışabildikleri için de bu kilit
+# şart: iki ağır işlem aynı anda parquet/computed.json'a yazarsa yarışıp
+# bozar. Kilit tek işleme izin verir, ikincisi 409 alır. (asyncio.Lock DEĞİL
+# threading.Lock — çünkü artık sync/threadpool bağlamındayız.)
+_heavy_op_lock = threading.Lock()
+
+
+def heavy_op_guard(user: str = Depends(require_admin_perm('admin_veri'))):
+    """Önce admin auth (yalnız yetkili istek kilidi kapabilir), sonra ağır-işlem
+    kilidini bloklamadan al. Doluysa 409. yield sonrası finally kilidi bırakır
+    (endpoint hata verse bile)."""
+    if not _heavy_op_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail='Başka bir ağır işlem (yükleme/rebuild) sürüyor. Bitmesini bekleyip tekrar deneyin.',
+        )
+    try:
+        yield user
+    finally:
+        _heavy_op_lock.release()
+
+
+def _backup_computed(keep: int = 5) -> None:
+    """Mevcut computed.json'u zaman damgalı yedekler, son `keep` taneyi tutar
+    (2026-08-15 denetimi #10). Rebuild/upload YENİ (yanlış olabilecek) veriyi
+    yazmadan ÖNCE çağrılır — _assert_nonempty_result yalnız BOŞu yakalar;
+    yanlış-ama-dolu bir rebuild eski iyi veriyi geri dönülmez şekilde silerdi."""
+    if not DATA_COMPUTED.exists():
+        return
+    try:
+        DATA_BACKUPS.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        shutil.copy2(DATA_COMPUTED, DATA_BACKUPS / f'computed_{ts}.json')
+        eski = sorted(DATA_BACKUPS.glob('computed_*.json'))
+        for f in eski[:-keep]:
+            f.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"[backup] computed.json yedeklenemedi (yok sayılıyor): {e}")
+
+
+# Yükleme boyut sınırları (2026-10-04): bellek şişirme / ZIP bombası / disk doldurma koruması.
+MAX_XLSX_BYTES = 60 * 1024 * 1024            # tek xlsx (gerçek dosyalar 1-3 MB)
+MAX_ZIP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # yüklenen ZIP dosyasının kendisi
+MAX_ZIP_ENTRY_BYTES = 120 * 1024 * 1024      # ZIP içindeki tek dosya (açılmış)
+MAX_ZIP_TOTAL_BYTES = 6 * 1024 * 1024 * 1024   # ZIP içeriği toplamı (açılmış)
+MAX_IMPORT_ENTRY_BYTES = 600 * 1024 * 1024   # içe aktarma paketindeki tek dosya
+MAX_IMPORT_TOTAL_BYTES = 1500 * 1024 * 1024
+MAX_JSON_UPLOAD_BYTES = 80 * 1024 * 1024
+
+
+def _sinirli_oku(f, sinir: int, ad: str) -> bytes:
+    """Dosyayı en çok `sinir` bayt okur; aşarsa 413 (belleğe sınırsız okumayı önler)."""
+    veri = f.read(sinir + 1)
+    if len(veri) > sinir:
+        raise HTTPException(status_code=413, detail=f'{ad} çok büyük (en fazla {sinir // (1024 * 1024)} MB)')
+    return veri
+
+
+# Login brute-force koruması (2026-08-15 denetimi #5) — e-posta bazlı basit
+# sliding-window rate limit. Bir e-posta için son _LOGIN_WINDOW sn içinde
+# _LOGIN_MAX'ı aşan BAŞARISIZ deneme → 429. Başarılı girişte sayaç sıfırlanır.
+# In-memory (tek process — bkz. uvicorn.run tek-worker notu); restart'ta sıfırlanır.
+_LOGIN_MAX = 5
+_LOGIN_WINDOW = 300  # 5 dakika
+_login_attempts: dict = {}
+_login_lock = threading.Lock()
+
+
+def _login_allowed(key: str) -> bool:
+    now = datetime.now().timestamp()
+    with _login_lock:
+        arr = [t for t in _login_attempts.get(key, []) if now - t < _LOGIN_WINDOW]
+        _login_attempts[key] = arr
+        return len(arr) < _LOGIN_MAX
+
+
+def _login_record_fail(key: str) -> None:
+    now = datetime.now().timestamp()
+    with _login_lock:
+        _login_attempts.setdefault(key, []).append(now)
+
+
+def _login_reset(key: str) -> None:
+    with _login_lock:
+        _login_attempts.pop(key, None)
+
+# Frontend
+HTML_USER = FRONTEND_DIR / 'index_v30.html'
+HTML_ADMIN = FRONTEND_DIR / 'admin.html'
+HTML_LOGIN = FRONTEND_DIR / 'login.html'
+HTML_SIGNUP = FRONTEND_DIR / 'signup.html'
+
+
+# ============================================================
+# İlk açılış — data/ klasörünün var olduğundan emin ol
+# ============================================================
+def _groups_kanonik(groups: dict) -> dict:
+    """Canlı grup yapısındaki eski banka adlarını kanonik adlara çevirir
+    (pipeline/banka_adlari.py; ör. 'QNB Finansbank' → 'QNB')."""
+    if not BANKA_AD_ESLEME:
+        return groups
+    k = kanonik_banka
+    g = dict(groups)
+    g['members'] = {k(ad): [k(b) for b in uyeler] for ad, uyeler in (groups.get('members') or {}).items()}
+    g['order'] = [k(ad) for ad in groups.get('order') or []]
+    g['colors'] = {k(ad): r for ad, r in (groups.get('colors') or {}).items()}
+    if g.get('focus'):
+        g['focus'] = k(g['focus'])
+    if isinstance(g.get('rakip_cikarilan'), dict) and g['rakip_cikarilan'].get('banka'):
+        g['rakip_cikarilan'] = dict(g['rakip_cikarilan'], banka=k(g['rakip_cikarilan']['banka']))
+    return g
+
+
+def _sync_catalog_from_seed():
+    """catalog.json'un CONFIG kısmını (measures/compositions/banks) git-tracked
+    catalog.seed.json'dan tazeler; runtime-değişen `groups` (admin panelden
+    düzenlenen banka grupları) canlı data/catalog.json'dan KORUNUR (2026-08-15
+    denetimi #7 — kod↔config uyumsuzluğu kökten çözülür).
+
+    - Yeni ölçüler/kompozisyonlar kodla birlikte deploy olur (seed git'te).
+    - Grup düzenlemeleri deploy'da kaybolmaz (canlı groups korunur).
+    - İlk kurulum (canlı catalog yok): seed olduğu gibi kopyalanır.
+    - Seed yoksa (eski/lokal kurulum): dokunma, mevcut catalog.json kullanılır.
+    """
+    if not SEED_CATALOG.exists():
+        return
+    with open(SEED_CATALOG, encoding='utf-8') as f:
+        merged = json.load(f)
+    if DATA_CATALOG.exists():
+        try:
+            with open(DATA_CATALOG, encoding='utf-8') as f:
+                live = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            live = {}
+        if live.get('groups'):
+            live_groups = _groups_kanonik(live['groups'])
+            members = live_groups.get('members', {})
+            # 2026-11-02: Rakip Bankalar varsayılanı QNB, Denizbank, TEB, Yapı Kredi, Garanti Bankası olmalıdır.
+            rakip = members.get('Rakip Bankalar') or []
+            target_rakip = ['QNB', 'Denizbank', 'TEB', 'Yapı Kredi', 'Garanti Bankası']
+            if not rakip or set(rakip) != set(target_rakip):
+                members['Rakip Bankalar'] = (merged.get('groups', {}).get('members', {}).get('Rakip Bankalar') or target_rakip)
+            # Katılım Bankaları ve KT Hariç Katılım bütünlüğünü koru:
+            seed_members = (merged.get('groups', {}).get('members', {})) or {}
+            for g_adi in ('Katılım Bankaları', 'KT Hariç Katılım Bankaları'):
+                if g_adi in seed_members:
+                    mevcut_g = set(members.get(g_adi) or [])
+                    seed_g = seed_members[g_adi]
+                    if len(mevcut_g) < 2 and len(seed_g) >= 2:
+                        members[g_adi] = seed_g
+            live_groups['members'] = members
+            merged['groups'] = live_groups
+    rakip_set = set((merged.get('groups', {}).get('members', {}).get('Rakip Bankalar')) or [])
+    for b in merged.get('banks', []):
+        if b.get('tur') != 'Grup':
+            b['rakip'] = b.get('banka_adi') in rakip_set
+    tmp = DATA_CATALOG.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(DATA_CATALOG)
+    print(f"[startup] catalog.json seed'den senkronlandı ({len(merged.get('measures', []))} ölçü)")
+
+
+def _ad_degistir(obj, esleme: dict):
+    """Sözlük anahtarlarında ve liste/str değerlerde eski banka adlarını kanonik ada çevirir."""
+    if isinstance(obj, dict):
+        return {esleme.get(k, k) if isinstance(k, str) else k: _ad_degistir(v, esleme) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_ad_degistir(v, esleme) for v in obj]
+    if isinstance(obj, str):
+        return esleme.get(obj, obj)
+    return obj
+
+
+def _banka_adi_gocu() -> None:
+    """Banka yeniden adlandırma göçü (2026-10-02, pipeline/banka_adlari.py). İdempotent; eski ad
+    yoksa hiçbir şey yapmaz. data/raw klasörü, parquet ve computed.json eski adlardan arındırılır —
+    aksi halde artımlı yüklemede aynı banka iki adla (ör. 'QNB Finansbank' + 'QNB') çift satır
+    üretirdi."""
+    if not BANKA_AD_ESLEME:
+        return
+    for eski, yeni in BANKA_AD_ESLEME.items():
+        kaynak, hedef = DATA_RAW / eski, DATA_RAW / yeni
+        if kaynak.is_dir():
+            hedef.mkdir(parents=True, exist_ok=True)
+            for f in kaynak.iterdir():
+                if not (hedef / f.name).exists():
+                    shutil.move(str(f), str(hedef / f.name))
+            shutil.rmtree(kaynak, ignore_errors=True)
+            print(f"[startup] data/raw/{eski} → data/raw/{yeni}")
+    if DATA_PARQUET.exists():
+        import pandas as pd
+        try:
+            adlar = set(pd.read_parquet(DATA_PARQUET, columns=['Banka Adı'])['Banka Adı'].astype(str).unique())
+        except Exception:  # noqa: BLE001
+            adlar = set()
+        if adlar & set(BANKA_AD_ESLEME):
+            df = pd.read_parquet(DATA_PARQUET)
+            col = df['Banka Adı'].astype(str).replace(BANKA_AD_ESLEME)
+            df['Banka Adı'] = col.astype('category')
+            tmp = DATA_PARQUET.with_suffix('.tmp')
+            df.to_parquet(tmp, index=False)
+            tmp.replace(DATA_PARQUET)
+            print(f"[startup] parquet banka adları güncellendi: {sorted(adlar & set(BANKA_AD_ESLEME))}")
+    if DATA_COMPUTED.exists():
+        ham = DATA_COMPUTED.read_text(encoding='utf-8')
+        if any(f'"{eski}"' in ham for eski in BANKA_AD_ESLEME):
+            tmp = DATA_COMPUTED.with_suffix('.tmp')   # (_write_computed bu noktada henüz tanımlı değil)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(_ad_degistir(json.loads(ham), BANKA_AD_ESLEME), f, ensure_ascii=False, separators=(',', ':'))
+                f.flush()
+                os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+            tmp.replace(DATA_COMPUTED)
+            print('[startup] computed.json banka adları güncellendi')
+
+
+def _makro_meta_guncelle() -> None:
+    """computed.json meta.makro'yu (Reel TL / USD katsayıları) pipeline/makro_seriler.json ile
+    güncel tutar (2026-10-02). Veri yeniden hesaplanmadan makro dosyası yenilense de (ör. deploy)
+    pano bir sonraki açılışta yeni katsayıları kullanır. Değişiklik yoksa dosyaya dokunmaz."""
+    if not DATA_COMPUTED.exists():
+        return
+    from pipeline.makro import donem_makro
+    try:
+        with open(DATA_COMPUTED, encoding='utf-8') as f:
+            computed = json.load(f)
+    except (OSError, ValueError):
+        return
+    meta = computed.get('meta') or {}
+    yeni = donem_makro(meta.get('dates') or [])
+    if meta.get('makro') == yeni:
+        return
+    meta['makro'] = yeni
+    computed['meta'] = meta
+    tmp = DATA_COMPUTED.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(computed, f, ensure_ascii=False, separators=(',', ':'))
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(DATA_COMPUTED)
+    print('[startup] computed.json meta.makro güncellendi')
+
+
+def _sync_computed_metadata() -> None:
+    """computed.json metadata'sını (meta.timestamp, groups, banks, compositions)
+    catalog.json ile eşitler (2026-11-02). Eksik meta.timestamp varsa tamamlar."""
+    if not DATA_COMPUTED.exists() or not DATA_CATALOG.exists():
+        return
+    try:
+        with open(DATA_CATALOG, encoding='utf-8') as f:
+            cat = json.load(f)
+        with open(DATA_COMPUTED, encoding='utf-8') as f:
+            comp = json.load(f)
+    except (OSError, ValueError):
+        return
+
+    meta = comp.get('meta') or {}
+    changed = False
+
+    # 1. timestamp senkronizasyonu
+    ts = comp.get('timestamp') or datetime.now().isoformat()
+    if meta.get('timestamp') != ts:
+        meta['timestamp'] = ts
+        changed = True
+
+    # 2. compositions senkronizasyonu
+    if cat.get('compositions') and meta.get('compositions') != cat.get('compositions'):
+        meta['compositions'] = cat['compositions']
+        changed = True
+
+    # 3. groups ve banks senkronizasyonu
+    cat_groups = (cat.get('groups') or {}).get('members') or {}
+    comp_groups = meta.get('groups') or {}
+    if cat_groups and comp_groups != cat_groups:
+        meta['groups'] = cat_groups
+        if (cat.get('groups') or {}).get('order'):
+            meta['group_order'] = cat['groups']['order']
+        if (cat.get('groups') or {}).get('colors'):
+            meta['group_colors'] = cat['groups']['colors']
+        changed = True
+
+    if cat.get('banks') and meta.get('banks') != cat.get('banks'):
+        meta['banks'] = cat['banks']
+        changed = True
+
+    if changed:
+        comp['meta'] = meta
+        tmp = DATA_COMPUTED.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(comp, f, ensure_ascii=False, separators=(',', ':'))
+            f.flush()
+            os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+        tmp.replace(DATA_COMPUTED)
+        print('[startup] computed.json metadata senkronlandı (meta.timestamp, groups, banks)')
+
+
+def ensure_data_dir():
+    """data/ ve data/raw/ klasörlerini oluşturur, upload_history.json/users.json yoksa yaratır."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_RAW.mkdir(parents=True, exist_ok=True)
+
+    # catalog.json'u git-tracked seed'den senkronla (config güncel, gruplar korunur)
+    _sync_catalog_from_seed()
+    _banka_adi_gocu()
+    _makro_meta_guncelle()
+    _sync_computed_metadata()
+
+    if not DATA_HISTORY.exists():
+        DATA_HISTORY.write_text(json.dumps({'uploads': []},
+                                            ensure_ascii=False, indent=2))
+        print(f"[startup] {DATA_HISTORY} oluşturuldu")
+
+    users_mod.ensure_users_file(DATA_USERS)
+    roles_mod.ensure_roles_file(DATA_ROLES)
+    # Panelden girilmiş asistan anahtarları süreç ortamına (sunucu ortamını ezer).
+    asistan_anahtarlar.uygula(DATA_ASISTAN_ANAHTAR)
+
+    # Admin, kendi Basic Auth şifresiyle üyelik sistemi (session tabanlı)
+    # üzerinden de dashboard'a girebilsin — ayrı bir üye hesabı açıp kendi
+    # onayını beklemesi gerekmesin. Idempotent, her başlangıçta senkronize
+    # edilir (bkz. users.py::upsert_admin_account).
+    users_mod.upsert_admin_account(
+        DATA_USERS, f'{USERNAME}@admin.local', USERNAME.capitalize(), PASSWORD
+    )
+
+
+
+def _get_or_create_session_secret() -> str:
+    """
+    Oturum çerezlerini imzalamak için kullanılan secret — dosyada kalıcı
+    olmalı, aksi halde her sunucu restart'ında (bu projede sık oluyor,
+    bkz. memory: kismi-ceyrek-grup-agregasyonu-bug.md) TÜM üyelerin
+    oturumu sessizce geçersiz kalırdı.
+    """
+    if SESSION_SECRET_PATH.exists():
+        return SESSION_SECRET_PATH.read_text().strip()
+    secret = secrets.token_urlsafe(32)
+    SESSION_SECRET_PATH.write_text(secret)
+    try:
+        os.chmod(SESSION_SECRET_PATH, 0o600)
+    except OSError:
+        pass
+    return secret
+
+
+# KRİTİK (2026-08-12'de bulunan bug): ensure_data_dir() (ve içindeki
+# upsert_admin_account, users.json'a KOŞULSUZ yazan bir işlem) modül
+# seviyesinde çağrılıyor. pipeline/ingest.py::rebuild_parquet'in kullandığı
+# ProcessPoolExecutor, her worker'ı 'spawn' ile başlatırken bu dosyayı
+# (app.py) YENİDEN İÇE AKTARIYOR — bu da ensure_data_dir()'ı HER WORKER'DA
+# (10'a kadar paralel) TEKRAR ÇALIŞTIRIYORDU. Çoklu worker AYNI ANDA
+# users.json/.tmp dosyasına yazmaya çalışınca yarış durumu oluşuyor,
+# bir worker diğerinin .tmp dosyasını zaten taşımış oluyor,
+# FileNotFoundError ile worker çöküyor, tüm rebuild 'BrokenProcessPool'
+# hatasıyla başarısız oluyordu. Fix: SADECE ana süreçte çalıştır.
+if multiprocessing.current_process().name == 'MainProcess':
+    ensure_data_dir()
+
+
+# ============================================================
+# FastAPI app
+# ============================================================
+app = FastAPI(
+    title='KT Stratejik Kokpit',
+    description='Kuveyt Türk rekabet analizi dashboard',
+    version='3.0.0',
+    # Production'da API şeması/dokümanı kapatılır (denetim #6 — sızıntı önlemi).
+    docs_url=None if KT_PRODUCTION else '/docs',
+    redoc_url=None if KT_PRODUCTION else '/redoc',
+    openapi_url=None if KT_PRODUCTION else '/openapi.json',
+)
+
+# Üyelik oturumları için imzalı çerez tabanlı session (2026-08-12).
+# https_only: production'da True (TLS proxy arkasında Secure çerez), lokal HTTP
+# dev'de False (denetim #4). KT_PRODUCTION env'iyle kontrol edilir.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_get_or_create_session_secret(),
+    session_cookie='kt_session',
+    max_age=14 * 24 * 60 * 60,  # 14 gün
+    same_site='lax',
+    https_only=KT_PRODUCTION,
+)
+
+
+_SAYFA_DOSYALARI = {'/': HTML_USER, '/admin': HTML_ADMIN, '/login': HTML_LOGIN, '/signup': HTML_SIGNUP}
+_csp_onbellek: Dict[str, tuple] = {}
+
+
+def _sayfa_csp(dosya: Path) -> str:
+    """Sayfaya özel (satır içi betik karmalı) CSP; dosya değişince yeniden hesaplanır."""
+    try:
+        m = dosya.stat().st_mtime_ns
+        eski = _csp_onbellek.get(str(dosya))
+        if eski and eski[0] == m:
+            return eski[1]
+        csp = security.sayfa_csp(dosya.read_text(encoding='utf-8'))
+        _csp_onbellek[str(dosya)] = (m, csp)
+        return csp
+    except OSError:
+        return security.SECURITY_HEADERS['Content-Security-Policy']
+
+
+@app.middleware('http')
+async def _guvenlik_ara_katmani(request: Request, call_next):
+    """Durum değiştiren isteklerde Origin denetimi (CSRF, SameSite=Lax'a ikinci katman) ve tüm yanıtlara
+    güvenlik başlıkları (2026-10-04)."""
+    if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') and not security.origin_ok(request):
+        return JSONResponse({'detail': 'Geçersiz istek kaynağı (Origin)'}, status_code=403)
+    yanit = await call_next(request)
+    kimlik = getattr(request.state, 'denetim_kimlik', None)
+    if kimlik and audit.izlenir_mi(request.method, request.url.path):
+        audit.kaydet(DATA_DENETIM, kimlik, request.method, request.url.path, yanit.status_code,
+                     security.client_ip(request, KT_PRODUCTION))
+    for k, v in security.SECURITY_HEADERS.items():
+        yanit.headers.setdefault(k, v)
+    sayfa = _SAYFA_DOSYALARI.get(request.url.path)
+    if sayfa is not None and yanit.status_code in (200, 304):   # 304'te de gönderilir: tarayıcı önbellekteki sayfaya bu başlığı uygular
+        yanit.headers['Content-Security-Policy'] = _sayfa_csp(sayfa)
+    if KT_PRODUCTION:
+        yanit.headers.setdefault('Strict-Transport-Security', security.HSTS)
+    return yanit
+
+
+# Sıkıştırma (2026-09-29): /api/data 10,4 MB → 3,0 MB, HTML 520 → 197 KB.
+# Seviye 6: varsayılan 9 10 MB için 0,68 sn CPU harcarken 6 aynı boyuta 0,19
+# sn'de iniyor. Asistanın text/event-stream akışını Starlette zaten sıkıştırmaz.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+
+
+# ============================================================
+# Public endpoint'ler (auth gerek yok)
+# ============================================================
+@app.get('/healthz', include_in_schema=False)
+def healthz():
+    # Herkese açık uç: sunucu dosya yolu gibi iç bilgi sızdırılmaz (2026-10-04)
+    return {
+        'status': 'ok',
+        'has_data': DATA_COMPUTED.exists(),
+        'data_dir_writable': os.access(DATA_DIR, os.W_OK),
+    }
+
+
+# ============================================================
+# Frontend
+# ============================================================
+# HTML yanıtlarında önbellek KAPALI: frontend tek büyük dosya olduğu için
+# tarayıcı onu agresif cache'liyordu ve her kod değişikliğinden sonra elle
+# hard-refresh (Cmd+Shift+R) gerekiyordu. Yerel kullanımda dosya diskten
+# anında okunduğu için cache'in bir faydası yok.
+NO_CACHE = {
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+}
+# Doğrulamalı önbellek (2026-09-29): 'no-store' yüzünden her sayfa açılışında
+# 10 MB'lık veri baştan iniyordu. 'no-cache' tarayıcıya "her seferinde sor"
+# der — dosya değişmemişse sunucu 304 döner, gövde hiç gitmez; değişmişse yeni
+# sürüm gelir (eski veri gösterme riski yok).
+REVALIDATE = {'Cache-Control': 'no-cache, must-revalidate'}
+
+
+def _revalidated_file(path: Path, media_type: str, request: Request):
+    """FileResponse + If-None-Match → 304. Starlette'in FileResponse'u ETag
+    başlığını koyar ama koşullu isteğe kendisi 304 dönmez. stat_result verilir
+    ki ETag yanıt oluşturulurken hesaplansın (verilmezse gönderim sırasında
+    hesaplanıyor ve burada karşılaştırılamıyordu)."""
+    resp = FileResponse(path, media_type=media_type, headers=REVALIDATE,
+                        stat_result=os.stat(path))
+    etag = resp.headers.get('etag')
+    inm = request.headers.get('if-none-match')
+    if etag and inm and etag in [t.strip() for t in inm.split(',')]:
+        return Response(status_code=304, headers={'ETag': etag, **REVALIDATE})
+    return resp
+
+
+@app.get('/', response_class=HTMLResponse)
+def root(request: Request):
+    """Ana sayfa — cockpit HTML."""
+    if not HTML_USER.exists():
+        return HTMLResponse(
+            f'<h1>Frontend bulunamadı</h1><p>{HTML_USER}</p>',
+            status_code=500,
+        )
+    return _revalidated_file(HTML_USER, 'text/html', request)
+
+
+@app.get('/admin', response_class=HTMLResponse)
+def admin_page(_: str = Depends(require_admin_access)):
+    """Admin paneli — coverage + upload + history + üyelik onayları."""
+    if not HTML_ADMIN.exists():
+        return HTMLResponse(
+            f'<h1>Admin sayfası bulunamadı</h1><p>{HTML_ADMIN}</p>',
+            status_code=500,
+        )
+    return FileResponse(HTML_ADMIN, media_type='text/html', headers=NO_CACHE)
+
+
+@app.get('/login', response_class=HTMLResponse)
+def login_page():
+    if not HTML_LOGIN.exists():
+        return HTMLResponse(f'<h1>Giriş sayfası bulunamadı</h1><p>{HTML_LOGIN}</p>', status_code=500)
+    return FileResponse(HTML_LOGIN, media_type='text/html', headers=NO_CACHE)
+
+
+@app.get('/signup', response_class=HTMLResponse)
+def signup_page():
+    if not HTML_SIGNUP.exists():
+        return HTMLResponse(f'<h1>Kayıt sayfası bulunamadı</h1><p>{HTML_SIGNUP}</p>', status_code=500)
+    return FileResponse(HTML_SIGNUP, media_type='text/html', headers=NO_CACHE)
+
+
+# ============================================================
+# Üyelik: kayıt / giriş / çıkış (2026-08-12)
+# ============================================================
+class SignupPayload(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+
+@app.post('/api/signup')
+def api_signup(payload: SignupPayload, request: Request):
+    """Herkese açık kayıt — oluşan hesap 'pending' durumunda, admin
+    onaylamadan giriş yapılamaz (bkz. users.py, /api/admin/users/*)."""
+    ip = _ip(request)
+    if not _RL_SIGNUP_IP.izinli(ip):
+        raise HTTPException(status_code=429, detail='Çok fazla başvuru denemesi. Lütfen daha sonra tekrar deneyin.')
+    _RL_SIGNUP_IP.hata(ip)   # her deneme sayılır (başarılı olan da): sel koruması
+    ok, err = users_mod.create_signup(DATA_USERS, payload.name, payload.email, payload.password)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    return {'status': 'ok', 'message': 'Başvurunuz alındı. Admin onayından sonra giriş yapabilirsiniz.'}
+
+
+@app.post('/api/login')
+def api_login(payload: LoginPayload, request: Request):
+    # Brute-force koruması (denetim #5): e-posta bazlı rate limit.
+    key = (payload.email or '').strip().lower()
+    ip = _ip(request)
+    if not _login_allowed(key) or not _RL_LOGIN_IP.izinli(ip):
+        raise HTTPException(
+            status_code=429,
+            detail='Çok fazla başarısız giriş denemesi. Lütfen birkaç dakika sonra tekrar deneyin.',
+        )
+    user, err = users_mod.authenticate(DATA_USERS, payload.email, payload.password)
+    if not user:
+        _login_record_fail(key)
+        _RL_LOGIN_IP.hata(ip)
+        raise HTTPException(status_code=401, detail=err)
+    _login_reset(key)  # başarılı giriş → sayaç sıfırla
+    request.session.clear()   # oturum sabitleme (session fixation) önlemi: eski oturum verisi taşınmaz
+    # E-posta OTP (KT_OTP=true): şifre doğru olsa da oturum, kod girilene kadar AÇILMAZ; yalnız "kod bekleniyor" işaretlenir.
+    if otp.etkin() and not otp.muaf(user['email']):
+        hata = _otp_gonder(user['email'], giris=True)
+        if hata:
+            raise hata
+        request.session['otp_bekleyen'] = user['id']
+        return {'status': 'otp', 'email': otp.maskele(user['email'])}
+    request.session['user_id'] = user['id']
+    request.session['sv'] = int(user.get('oturum_surumu') or 0)
+    return {'status': 'ok', 'name': user['name']}
+
+
+def _otp_gonder(email: str, giris: bool = False):
+    """Kod üretip e-postayı yollar. Başarılıysa None, değilse fırlatılacak HTTPException."""
+    if not otp.smtp_hazir():
+        print('[otp] KT_OTP açık ama KT_SMTP_HOST tanımlı değil — giriş yapılamıyor')
+        return HTTPException(status_code=503, detail='Doğrulama kodu şu an gönderilemiyor. Lütfen yöneticiyle iletişime geçin.')
+    try:
+        ok, mesaj = otp.kod_iste(email)
+    except Exception as exc:   # SMTP ayrıntısı kullanıcıya gösterilmez
+        print(f'[otp] e-posta gönderilemedi: {type(exc).__name__}: {exc}')
+        return HTTPException(status_code=503, detail='Doğrulama kodu gönderilemedi. Lütfen biraz sonra tekrar deneyin.')
+    if not ok:
+        if giris and otp.bekleyen_kod_var(email):
+            return None   # şifre adımı kod hız sınırına takıldı ama önceki kod hâlâ geçerli: kullanıcı o kodla devam eder
+        return HTTPException(status_code=429, detail=mesaj)
+    return None
+
+
+class OtpPayload(BaseModel):
+    code: str
+
+
+def _otp_bekleyen_kullanici(request: Request) -> dict:
+    uid = request.session.get('otp_bekleyen')
+    user = users_mod.get_user_by_id(DATA_USERS, uid) if uid else None
+    if not user or user.get('status') != 'approved':
+        request.session.clear()
+        raise HTTPException(status_code=401, detail='Giriş süresi doldu. Lütfen şifrenizle yeniden giriş yapın.')
+    return user
+
+
+@app.post('/api/login/otp')
+def api_login_otp(payload: OtpPayload, request: Request):
+    """Şifre adımından sonra e-postaya gelen kodu doğrular; doğruysa oturumu açar."""
+    user = _otp_bekleyen_kullanici(request)
+    ip = _ip(request)
+    if not _RL_LOGIN_IP.izinli(ip):
+        raise HTTPException(status_code=429, detail='Çok fazla başarısız deneme. Lütfen birkaç dakika sonra tekrar deneyin.')
+    ok, mesaj = otp.kod_dogrula(user['email'], payload.code)
+    if not ok:
+        _RL_LOGIN_IP.hata(ip)
+        raise HTTPException(status_code=401, detail=mesaj)
+    request.session.clear()   # oturum sabitleme önlemi
+    request.session['user_id'] = user['id']
+    request.session['sv'] = int(user.get('oturum_surumu') or 0)
+    return {'status': 'ok', 'name': user['name']}
+
+
+@app.post('/api/login/otp/yeniden')
+def api_login_otp_yeniden(request: Request):
+    """Kod gelmediyse yenisini ister (60 sn bekleme + 15 dk'da en çok 3 kod: otp.kod_iste)."""
+    user = _otp_bekleyen_kullanici(request)
+    hata = _otp_gonder(user['email'])
+    if hata:
+        raise hata
+    return {'status': 'otp', 'email': otp.maskele(user['email'])}
+
+
+@app.post('/api/logout')
+def api_logout(request: Request):
+    request.session.clear()
+    return {'status': 'ok'}
+
+
+@app.get('/api/me')
+def api_me(user: dict = Depends(require_member)):
+    role = user_role(user)
+    catalog = _load_catalog()
+    return {'name': user['name'], 'email': user['email'], 'role': role['id'], 'role_ad': role['ad'],
+            'izinler': role['izinler'], 'asistan_gunluk': role['asistan_gunluk'],
+            'odak_banka': _kullanici_odak(user, catalog), 'odak_varsayilan': focus_of(catalog),
+            'odak_secili': user.get('odak_banka') if 'odak_banka' in role['izinler'] else None}
+
+
+# ------------------------------------------------------------------
+# Kullanıcı bazlı odak banka (2026-10-02). Admin panelindeki odak banka VARSAYILAN'dır;
+# 'odak_banka' izni olan kullanıcı kendi odağını seçer. Ortak computed.json değişmez:
+# kullanıcının odağı varsayılandan farklıysa istemci /api/odak-katman'dan gelen küçük
+# yamayı (değişen gruplar + meta) veriye uygular. Yama, veri sürümü ve grup yapısıyla
+# anahtarlanmış diskte önbelleklenir (ilk istekte ~2 sn).
+# ------------------------------------------------------------------
+DATA_ODAK_KATMAN = DATA_DIR / 'odak_katman'
+
+
+def _gercek_bankalar(catalog: dict) -> set:
+    return {b['banka_adi'] for b in catalog.get('banks', []) if b.get('tur') != 'Grup'}
+
+
+def _kullanici_odak(user: Optional[dict], catalog: Optional[dict] = None) -> str:
+    catalog = catalog or _load_catalog()
+    varsayilan = focus_of(catalog)
+    if not user or 'odak_banka' not in user_perms(user):
+        return varsayilan
+    secili = kanonik_banka(user.get('odak_banka') or '')
+    return secili if secili in _gercek_bankalar(catalog) else varsayilan
+
+
+def _kullanici_rakipler(user: Optional[dict], catalog: dict, odak: Optional[str] = None) -> Optional[List[str]]:
+    """Kullanıcının odağı için kendi seçtiği rakip listesi (2026-10-03); yoksa None (otomatik liste)."""
+    if not user or 'odak_banka' not in user_perms(user):
+        return None
+    return rakipleri_normalle(catalog, odak or _kullanici_odak(user, catalog), user.get('rakipler'))
+
+
+def _otomatik_rakipler(catalog: dict, odak: str) -> List[str]:
+    """Odak banka seçilince katalogdaki listeden otomatik kurulan rakip listesi (apply_focus_bank)."""
+    import copy
+    varyant = copy.deepcopy(catalog)
+    if odak != focus_of(varyant):
+        apply_focus_bank(varyant, odak)
+    return list(((varyant.get('groups') or {}).get('members') or {}).get(RAKIP_GRUBU) or [])
+
+
+def _odak_katman_dosyasi(catalog: dict, banka: str, rakipler: Optional[List[str]] = None) -> Path:
+    import hashlib
+    st = os.stat(DATA_COMPUTED)
+    anahtar = json.dumps([banka, rakipler or None, st.st_mtime_ns, st.st_size, catalog.get('groups')],
+                         sort_keys=True, ensure_ascii=False, default=str)
+    path = DATA_ODAK_KATMAN / (hashlib.sha1(anahtar.encode('utf-8')).hexdigest()[:20] + '.json')
+    if path.exists():
+        return path
+    from pipeline import LookupContext
+    from pipeline.focus import focus_overlay
+    with open(DATA_COMPUTED, encoding='utf-8') as f:
+        computed = json.load(f)
+    ctx = LookupContext.from_parquet(DATA_PARQUET, {b['banka_adi']: b['tur'] for b in catalog['banks']})
+    katman = focus_overlay(catalog, computed, ctx, banka, rakipler)
+    DATA_ODAK_KATMAN.mkdir(parents=True, exist_ok=True)
+    # Eski veri sürümüne ait katmanlar silinir (computed.json'dan eski olanlar).
+    for eski in DATA_ODAK_KATMAN.glob('*.json'):
+        try:
+            if eski.stat().st_mtime < st.st_mtime:
+                eski.unlink()
+        except OSError:
+            pass
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(katman, f, ensure_ascii=False, separators=(',', ':'))
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(path)
+    return path
+
+
+@app.get('/api/odak-katman')
+def api_odak_katman(request: Request, user: dict = Depends(require_member)):
+    """Kullanıcının odağı varsayılandan farklıysa yamayı, değilse boş nesne döndürür."""
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(status_code=503, detail='computed.json yok')
+    catalog = _load_catalog()
+    odak = _kullanici_odak(user, catalog)
+    rakipler = _kullanici_rakipler(user, catalog, odak)
+    if odak == focus_of(catalog) and not rakipler:
+        return JSONResponse({}, headers=NO_CACHE)
+    yol = _odak_katman_dosyasi(catalog, odak, rakipler)
+    gizli = _gizli_olculer(user)
+    return _filtreli_json_yanit(yol, gizli, request) if gizli else _revalidated_file(yol, 'application/json', request)
+
+
+_KATMAN_ONBELLEK: Dict[str, dict] = {}
+
+
+def _kullanici_katmani(user: dict, catalog: dict) -> Optional[dict]:
+    """Asistan için kullanıcının odak katmanı (grup üyelikleri + değişen grup değerleri); yoksa None."""
+    odak = _kullanici_odak(user, catalog)
+    rakipler = _kullanici_rakipler(user, catalog, odak)
+    if odak == focus_of(catalog) and not rakipler:
+        return None
+    try:
+        path = _odak_katman_dosyasi(catalog, odak, rakipler)
+        if str(path) not in _KATMAN_ONBELLEK:
+            if len(_KATMAN_ONBELLEK) > 16:
+                _KATMAN_ONBELLEK.clear()
+            with open(path, encoding='utf-8') as f:
+                _KATMAN_ONBELLEK[str(path)] = json.load(f)
+        return _KATMAN_ONBELLEK[str(path)]
+    except Exception as e:   # katman üretilemezse asistan ortak veriyle çalışmaya devam eder
+        print(f'[asistan] odak katmanı yüklenemedi: {e}')
+        return None
+
+
+class OdakSecimPayload(BaseModel):
+    banka: Optional[str] = None
+    rakipler: Optional[List[str]] = None   # 2026-10-03: bu odak için seçilen rakip listesi (yoksa otomatik)
+
+
+@app.put('/api/me/odak-banka')
+def api_set_odak_banka(payload: OdakSecimPayload, user: dict = Depends(require_perm('odak_banka'))):
+    catalog = _load_catalog()
+    banka = kanonik_banka(payload.banka) if payload.banka else None
+    if banka and banka not in _gercek_bankalar(catalog):
+        raise HTTPException(status_code=400, detail=f'Bilinmeyen banka: {banka}')
+    if banka == focus_of(catalog):
+        banka = None   # varsayılanla aynı → kişisel seçim tutulmaz
+    odak = banka or focus_of(catalog)
+    rakipler = rakipleri_normalle(catalog, odak, payload.rakipler)
+    if rakipler and rakipler == _otomatik_rakipler(catalog, odak):
+        rakipler = None   # otomatik listeyle aynı → ayrıca tutulmaz
+    users_mod.set_focus_bank(DATA_USERS, user['id'], banka, rakipler)
+    user = dict(user, odak_banka=banka, rakipler=rakipler)
+    if odak != focus_of(catalog) or rakipler:
+        _odak_katman_dosyasi(catalog, odak, rakipler)   # yamayı şimdi hazırla: sayfa yenilenince hemen gelsin
+    return {'odak_banka': odak, 'odak_secili': banka, 'rakipler': rakipler or _otomatik_rakipler(catalog, odak)}
+
+
+def _rakip_onerisi(banka: Optional[str], dil: Optional[str] = None) -> dict:
+    """Odak banka için yapay zeka rakip önerisi (2026-10-03); model yoksa veriye dayalı benzerlik."""
+    from assistant import rakip_oneri
+    catalog = _load_catalog()
+    banka = kanonik_banka(banka or '') or focus_of(catalog)
+    if banka not in _gercek_bankalar(catalog):
+        raise HTTPException(status_code=400, detail=f'Bilinmeyen banka: {banka}')
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(status_code=503, detail='Veri henüz yüklenmemiş.')
+    ASSISTANT_STORE.refresh()
+    st = os.stat(DATA_COMPUTED)
+    n = len(((catalog.get('groups') or {}).get('members') or {}).get(RAKIP_GRUBU) or []) or rakip_oneri.VARSAYILAN_SAYI
+    sonuc = rakip_oneri.rakip_oner(ASSISTANT_STORE.computed, catalog, banka, assistant_llm.LLMConfig.from_env(),
+                                   n=n, anahtar=(st.st_mtime_ns, st.st_size), dil=dil or 'tr')
+    return dict(sonuc, otomatik=_otomatik_rakipler(catalog, banka))
+
+
+@app.get('/api/rakip-oneri')
+def api_rakip_oneri(banka: Optional[str] = None, dil: Optional[str] = None,
+                    user: dict = Depends(require_perm('odak_banka'))):
+    return _rakip_onerisi(banka, dil)
+
+
+@app.get('/api/admin/rakip-oneri')
+def admin_rakip_oneri(banka: Optional[str] = None, dil: Optional[str] = None,
+                      _: str = Depends(require_admin_perm('admin_gruplar'))):
+    return _rakip_onerisi(banka, dil)
+
+
+class ChangePasswordPayload(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post('/api/change-password')
+def api_change_password(payload: ChangePasswordPayload, request: Request,
+                        user: dict = Depends(require_member)):
+    """Giriş yapmış kullanıcı kendi şifresini değiştirir (2026-08-15).
+    Env-senkron admin hesapları (…@admin.local) hariç: onların şifresi
+    start.sh (KT_PASSWORD) tarafından her başlangıçta sıfırlandığından UI'dan
+    kalıcı değiştirilemez — kullanıcı start.sh'a yönlendirilir."""
+    email = user.get('email', '').strip().lower()
+    if email.endswith('@admin.local'):
+        raise HTTPException(
+            status_code=400,
+            detail='Bu hesabın şifresi sunucu yapılandırmasından (start.sh → KT_PASSWORD) yönetilir.',
+        )
+    ok, err = users_mod.change_password(
+        DATA_USERS, user['id'], payload.current_password, payload.new_password
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    # Diğer cihazlardaki oturumlar düştü; bu oturum yeni sürümle devam eder.
+    request.session['sv'] = int((users_mod.get_user_by_id(DATA_USERS, user['id']) or {}).get('oturum_surumu') or 0)
+    return {'status': 'ok', 'message': 'Şifreniz güncellendi.'}
+
+
+# ============================================================
+# Özel ölçüler ("Ölçü Oluştur") + kayıtlı görünümler ("Görünümlerim")
+# (2026-09-17) — SADECE oturum sahibinin kendi profiline özel (require_member,
+# başka üye/admin göremiyor). 2026-09-25: tüm onaylı üyelere açık (önceden
+# 2026-09-18'den beri yalnız role='admin'). Formül SUNUCUDA hesaplanmıyor —
+# sadece tanımı (ifade ağacı, bkz. pipeline/custom_measure_rules) saklanır;
+# değerler frontend'de mevcut computed.json ölçülerinden anlık türetilir (bkz.
+# frontend/index_v30.html::injectCustomMeasures). Formüldeki ölçüler GERÇEK
+# catalog.json ölçüleri olmalı — başka bir özel ölçüye referans YOK
+# (zincir/döngü riskinden kaçınmak için). Görünümler ise düz bir id listesi olduğundan hem gerçek hem
+# özel ölçü id'lerini serbestçe karışık içerebilir.
+# ============================================================
+
+def _catalog_measures_by_id() -> Dict[str, dict]:
+    catalog = _load_catalog()
+    return {m['id']: m for m in catalog.get('measures', [])}
+
+
+def _validate_custom_measure_payload(p: 'CustomMeasurePayload') -> None:
+    """Anlam kuralları (pipeline/custom_measure_rules — tarayıcı aynı
+    kuralları uygular) + katalogdaki bir ölçüyle aynı ad olmasın. Formül
+    'expr' (ifade ağacı) ya da eski tek işlemli op/a/b ile gelebilir."""
+    by_id = _catalog_measures_by_id()
+    if p.expr is not None:
+        err = custom_measure_rules.check_expr(p.expr, by_id)
+    else:
+        err = custom_measure_rules.check(p.op, p.a, p.b, p.bicim, by_id)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    key = ' '.join((p.ad or '').split()).casefold()
+    if any(' '.join(m['ad'].split()).casefold() == key for m in by_id.values()):
+        raise HTTPException(status_code=400, detail='Bu ad hazır bir ölçüde kullanılıyor, farklı bir ad seçin')
+
+
+class CustomMeasurePayload(BaseModel):
+    ad: str
+    # Yeni biçim (2026-09-25): ifade ağacı, bkz. pipeline/custom_measure_rules.
+    expr: Optional[Dict[str, Any]] = None
+    # Eski tek işlemli biçim (expr yoksa kullanılır, geriye uyumluluk):
+    op: Optional[str] = None      # ratio | diff | sum | scale
+    a: Optional[str] = None
+    b: Optional[str] = None
+    constant: Optional[float] = None
+    sort_direction: str = 'desc'
+    bicim: Optional[str] = None   # oran için 'pct' | 'kat'; None = varsayılan
+
+
+@app.get('/api/my/measures')
+def my_measures_list(user: dict = Depends(require_member)):
+    return {'measures': users_mod.list_custom_measures(DATA_USERS, user['id'])}
+
+
+@app.post('/api/my/measures')
+def my_measures_create(payload: CustomMeasurePayload, user: dict = Depends(require_perm('olcu_olustur'))):
+    _validate_custom_measure_payload(payload)
+    ok, result = users_mod.add_custom_measure(
+        DATA_USERS, user['id'], payload.ad, payload.op, payload.a,
+        payload.b, payload.constant, payload.sort_direction, payload.bicim,
+        expr=payload.expr,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=result)
+    return {'status': 'ok', 'measure': result}
+
+
+@app.put('/api/my/measures/{measure_id}')
+def my_measures_update(measure_id: str, payload: CustomMeasurePayload,
+                       user: dict = Depends(require_perm('olcu_olustur'))):
+    _validate_custom_measure_payload(payload)
+    ok, result = users_mod.update_custom_measure(
+        DATA_USERS, user['id'], measure_id, payload.ad, payload.op, payload.a,
+        payload.b, payload.constant, payload.sort_direction, payload.bicim,
+        expr=payload.expr,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=result)
+    return {'status': 'ok', 'measure': result}
+
+
+@app.delete('/api/my/measures/{measure_id}')
+def my_measures_delete(measure_id: str, user: dict = Depends(require_perm('olcu_olustur'))):
+    if not users_mod.delete_custom_measure(DATA_USERS, user['id'], measure_id):
+        raise HTTPException(status_code=404, detail='Özel ölçü bulunamadı')
+    return {'status': 'ok'}
+
+
+class SavedViewPayload(BaseModel):
+    ad: str
+    measure_ids: List[str]
+
+
+@app.get('/api/my/views')
+def my_views_list(user: dict = Depends(require_member)):
+    return {'views': users_mod.list_saved_views(DATA_USERS, user['id'])}
+
+
+@app.post('/api/my/views')
+def my_views_create(payload: SavedViewPayload, user: dict = Depends(require_perm('olcu_olustur'))):
+    ok, result = users_mod.add_saved_view(DATA_USERS, user['id'], payload.ad, payload.measure_ids)
+    if not ok:
+        raise HTTPException(status_code=400, detail=result)
+    return {'status': 'ok', 'view': result}
+
+
+@app.put('/api/my/views/{view_id}')
+def my_views_update(view_id: str, payload: SavedViewPayload, user: dict = Depends(require_perm('olcu_olustur'))):
+    ok, result = users_mod.update_saved_view(DATA_USERS, user['id'], view_id, payload.ad, payload.measure_ids)
+    if not ok:
+        raise HTTPException(status_code=400, detail=result)
+    return {'status': 'ok', 'view': result}
+
+
+@app.delete('/api/my/views/{view_id}')
+def my_views_delete(view_id: str, user: dict = Depends(require_perm('olcu_olustur'))):
+    if not users_mod.delete_saved_view(DATA_USERS, user['id'], view_id):
+        raise HTTPException(status_code=404, detail='Görünüm bulunamadı')
+    return {'status': 'ok'}
+
+
+# ============================================================
+# Asistan (Qwen chatbot) — 2026-09-27
+# Tüm onaylı üyelere açık. Model yalnız OKUYAN araçlar çağırır
+# (assistant/tools.py); özel ölçü taslağını kullanıcı arayüzden
+# /api/my/measures ile kendisi kaydeder. Yapılandırma ortam
+# değişkenlerinden: QWEN_API_KEY (ya da DASHSCOPE_API_KEY), QWEN_API_BASE,
+# QWEN_MODEL, QWEN_ENABLE_THINKING. Anahtar yoksa asistan kapalı (503).
+# Kullanıcı adı/e-postası modele gönderilmez.
+# ============================================================
+ASSISTANT_STORE = AssistantStore(DATA_COMPUTED, DATA_CATALOG, MEASURE_INFO_MD)
+CHAT_PER_MIN = int(os.environ.get('CHAT_PER_MIN', '8'))
+CHAT_PER_DAY = int(os.environ.get('CHAT_PER_DAY', '300'))
+# In-memory (tek process — bkz. uvicorn.run tek-worker notu); restart'ta sıfırlanır.
+_chat_calls: Dict[int, List[float]] = {}
+_chat_calls_lock = threading.Lock()
+
+
+def _chat_rate_error(user_id: int, per_day: int = CHAT_PER_DAY) -> Optional[str]:
+    """per_day: rolün günlük soru sınırı (2026-09-30, admin panelden rol
+    başına ayarlanır); CHAT_PER_MIN tüm rollerde ortak."""
+    now = time.time()
+    with _chat_calls_lock:
+        calls = [t for t in _chat_calls.get(user_id, []) if now - t < 86400]
+        if sum(1 for t in calls if now - t < 60) >= CHAT_PER_MIN:
+            return 'Çok sık soru gönderdiniz; bir dakika sonra tekrar deneyin.'
+        if len(calls) >= per_day:
+            return f'Rolünüzün günlük asistan sınırına ({per_day} soru) ulaştınız.'
+        calls.append(now)
+        _chat_calls[user_id] = calls
+    return None
+
+
+class ChatPayload(BaseModel):
+    messages: List[Dict[str, Any]]
+    ekran: Optional[Dict[str, Any]] = None   # {measure_id, tarih, mode} — "bu ölçü" bağlamı
+
+
+@app.get('/api/chat/status')
+def chat_status(user: dict = Depends(require_member)):
+    cfg = assistant_llm.LLMConfig.from_env()
+    role = user_role(user)
+    allowed = 'asistan' in role['izinler'] and role['asistan_gunluk'] > 0
+    return {'enabled': cfg is not None and allowed, 'model': cfg.model if cfg and allowed else None}
+
+
+@app.post('/api/chat')
+def chat(payload: ChatPayload, user: dict = Depends(require_perm('asistan'))):
+    cfg = assistant_llm.LLMConfig.from_env()
+    if cfg is None:
+        raise HTTPException(status_code=503, detail='Asistan yapılandırılmamış (QWEN_API_KEY yok).')
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(status_code=503, detail='Veri henüz yüklenmemiş.')
+    history = assistant_service.clean_history(payload.messages)
+    if not history or history[-1]['role'] != 'user':
+        raise HTTPException(status_code=400, detail='Son mesaj kullanıcı sorusu olmalı.')
+    role = user_role(user)
+    err = _chat_rate_error(user['id'], role['asistan_gunluk'])
+    if err:
+        raise HTTPException(status_code=429, detail=err)
+    custom = users_mod.list_custom_measures(DATA_USERS, user['id'])
+    catalog = _load_catalog()
+    # Kişisel odak / rakip listesi varsa asistan da kullanıcının gördüğü grup değerleriyle çalışır
+    katman = _kullanici_katmani(user, catalog)
+
+    def events():
+        try:
+            for ev in assistant_service.run_chat(cfg, ASSISTANT_STORE, history, custom, payload.ekran,
+                                                 dis_veri='asistan_dis_veri' in role['izinler'],
+                                                 odak=_kullanici_odak(user, catalog), katman=katman,
+                                                 gizli_olculer=_gizli_olculer(user)):
+                yield 'data: ' + json.dumps(ev, ensure_ascii=False) + '\n\n'
+        except Exception:
+            traceback.print_exc()
+            yield 'data: ' + json.dumps({'type': 'error', 'message': 'Beklenmeyen bir hata oluştu.'},
+                                        ensure_ascii=False) + '\n\n'
+
+    return StreamingResponse(events(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+# ============================================================
+# Veri okuma endpoint'leri — SADECE onaylı üyeler (2026-08-12'den önce
+# auth'suzdu, bkz. memory: guvenlik-sunucu-erisimi.md madde 2)
+# ============================================================
+REKABET_IZNI = 'rekabet_analizi'
+_filtreli_onbellek: Dict[tuple, bytes] = {}
+_filtreli_kilit = threading.Lock()
+
+
+def _gizlenebilir_kategoriler() -> List[str]:
+    """Admin panelinde rol bazında gizlenebilecek ölçü kategorileri (Rekabet ölçüleri ayrıca `rekabet_analizi` iznine bağlıdır)."""
+    sira: List[str] = []
+    for m in (_load_catalog().get('measures') or []):
+        k = m.get('kategori')
+        if k and k not in sira:
+            sira.append(k)
+    return sira
+
+
+def _gizli_olculer(user: Optional[dict]) -> frozenset:
+    """Kullanıcının rolünde kapalı olan ölçülerin id'leri: Rekabet ölçüleri (izne bağlı) + rolde gizlenen kategoriler
+    + rolün ölçü listesinde (`olculer`) bulunmayanlar."""
+    from pipeline.rekabet_olculer import IDS
+    gizli = set() if REKABET_IZNI in user_perms(user) else set(IDS)
+    rol = user_role(user)
+    izinli = rol.get('olculer')
+    if izinli is not None:   # rol yalnız seçili ölçüleri görür (2026-11-05); listede olmayan/sonradan eklenenler gizli
+        izinli = set(izinli)
+        gizli |= {m['id'] for m in (_load_catalog().get('measures') or []) if m['id'] not in izinli}
+    kategoriler = set(roles_mod.gizli_kategoriler(rol['izinler']))
+    if kategoriler:
+        gizli |= {m['id'] for m in (_load_catalog().get('measures') or []) if m.get('kategori') in kategoriler}
+    return frozenset(gizli)
+
+
+def _olcu_filtrele(veri, gizli: frozenset):
+    """computed.json / catalog.json içeriğinden gizli ölçüleri çıkarır (yerinde değil, yeni nesne)."""
+    out = dict(veri)
+    for anahtar in ('bank_data', 'group_data'):
+        if isinstance(out.get(anahtar), dict):
+            out[anahtar] = {k: v for k, v in out[anahtar].items() if k not in gizli}
+    if isinstance(out.get('catalog'), list):
+        out['catalog'] = [m for m in out['catalog'] if m.get('id') not in gizli]
+    elif isinstance(out.get('catalog'), dict):
+        out['catalog'] = _olcu_filtrele(out['catalog'], gizli)
+    if isinstance(out.get('measures'), list):
+        out['measures'] = [m for m in out['measures'] if m.get('id') not in gizli]
+    if isinstance(out.get('meta'), dict) and isinstance(out['meta'].get('available_measures'), list):
+        out['meta'] = dict(out['meta'], available_measures=[m for m in out['meta']['available_measures'] if m not in gizli])
+    return out
+
+
+def _filtreli_json_yanit(path: Path, gizli: frozenset, request: Request):
+    """İzni olmayan kullanıcıya gizli ölçüleri çıkarılmış JSON (dosya değişene kadar bellekte önbellekli, ETag'li)."""
+    st = os.stat(path)
+    anahtar = (str(path), st.st_mtime_ns, st.st_size, hash(gizli))
+    with _filtreli_kilit:
+        govde = _filtreli_onbellek.get(anahtar)
+        if govde is None:
+            with open(path, encoding='utf-8') as f:
+                govde = json.dumps(_olcu_filtrele(json.load(f), gizli), ensure_ascii=False,
+                                   separators=(',', ':')).encode('utf-8')
+            for k in [k for k in _filtreli_onbellek if k[0] == str(path)]:
+                _filtreli_onbellek.pop(k, None)
+            _filtreli_onbellek[anahtar] = govde
+    etag = '"f%x-%x-%x"' % (st.st_mtime_ns, st.st_size, hash(gizli) & 0xffffffff)
+    inm = request.headers.get('if-none-match')
+    if inm and etag in [t.strip() for t in inm.split(',')]:
+        return Response(status_code=304, headers={'ETag': etag, **REVALIDATE})
+    return Response(content=govde, media_type='application/json', headers={'ETag': etag, **REVALIDATE})
+
+
+@app.get('/api/data')
+def api_data(request: Request, user: dict = Depends(require_member)):
+    """Frontend'in çektiği ana JSON. Rolünde kapalı ölçüler (Rekabet Analizi) sunucuda çıkarılır."""
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(
+            status_code=503,
+            detail='computed.json yok. Admin paneli üzerinden veri yükleyin.',
+        )
+    gizli = _gizli_olculer(user)
+    if gizli:
+        return _filtreli_json_yanit(DATA_COMPUTED, gizli, request)
+    # Veri her yüklemede değişebilir: tarayıcı her açılışta sorar, dosya
+    # değişmediyse 304 alır (bkz. _revalidated_file).
+    return _revalidated_file(DATA_COMPUTED, 'application/json', request)
+
+
+@app.get('/api/catalog')
+def api_catalog(request: Request, user: dict = Depends(require_member)):
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=503, detail='catalog.json yok')
+    gizli = _gizli_olculer(user)
+    if gizli:
+        return _filtreli_json_yanit(DATA_CATALOG, gizli, request)
+    return FileResponse(DATA_CATALOG, media_type='application/json', headers=NO_CACHE)
+
+@app.get('/api/bos-nedenleri')
+def api_bos_nedenleri(request: Request, user: dict = Depends(require_member)):
+    """Rekabet Analizi ölçülerinde değeri boş hücrelerin nedenleri: {ölçü: {banka: {tarih: [kod, metin]}}}. Rekabet izni yoksa boş."""
+    if not DATA_BOS_NEDEN.exists():
+        return JSONResponse({}, headers=NO_CACHE)
+    gizli = _gizli_olculer(user)
+    if gizli:   # yalnız rolün görebildiği ölçülerin nedenleri (rol ölçü listesi 2026-11-05'ten beri tek tek olabilir)
+        try:
+            veri = json.loads(DATA_BOS_NEDEN.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            veri = {}
+        return JSONResponse({k: v for k, v in veri.items() if k not in gizli} if isinstance(veri, dict) else {}, headers=NO_CACHE)
+    return _revalidated_file(DATA_BOS_NEDEN, 'application/json', request)
+
+
+@app.get('/api/measure-info')
+def api_measure_info(user: dict = Depends(require_member)):
+    """Ölçü bilgi kartları (Tanım/Formül/Kaynak/Terimler) — docs/olcu_info_kartlari.md'den."""
+    kartlar = get_measure_info_cards(MEASURE_INFO_MD)
+    gizli = _gizli_olculer(user)
+    if gizli:
+        kartlar = {k: v for k, v in kartlar.items() if k not in gizli}
+    return JSONResponse(kartlar)
+
+
+@app.get('/api/whats-new')
+def api_whats_new(_: dict = Depends(require_member)):
+    """
+    "Yenilikler" penceresi (2026-08-25) — dashboard topbar'ındaki 🆕 butonu.
+    whats_new.json repo kökünde (catalog.seed.json gibi git-tracked, kod ile
+    deploy edilir — bkz. docs/BACKLOG.md'nin docs/ Docker COPY bug'ı: aynı
+    hataya düşmemek için data/ DEĞİL, kökte tutuluyor). İçerik elle
+    güncellenen basit bir liste (KARAR 2026-08-19) — admin panelden
+    düzenlenebilir bir UI yok, kasıtlı.
+
+    2026-09-16 KARAR: üyeler SADECE en son sürümde ne yapıldığını görür —
+    sürüm numarası/tarih göstermeden, tek girdi. Fazlı/versiyonlu tam
+    geçmiş artık sadece admin panelde (bkz. /api/admin/version-log) —
+    bilinçli olarak burada dönmüyor.
+    """
+    path = APP_ROOT / 'whats_new.json'
+    if not path.exists():
+        return []
+    try:
+        entries = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return []
+    if not entries:
+        return []
+    latest = entries[0]
+    return [{'title': latest.get('title', ''), 'items': latest.get('items', [])}]
+
+
+@app.get('/api/admin/version-log')
+def api_admin_version_log(_: str = Depends(require_admin_perm('admin_proje'))):
+    """
+    2026-09-16: admin panelindeki "Backlog" sekmesi için — whats_new.json'un
+    TAM içeriği (sürüm + tarih + madde listesi, en yeni en üstte). Üye
+    tarafındaki /api/whats-new'den BİLİNÇLİ olarak ayrı: kullanıcı kararı
+    "haftalık ne yapıldığı sadece adminlerin görebileceği, versiyon adıyla
+    aşama aşama" bir backlog istiyor — üyeler sadece en son sürümü,
+    sürüm/tarih olmadan görür (yukarıdaki endpoint).
+    """
+    path = APP_ROOT / 'whats_new.json'
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return []
+
+
+@app.get('/api/version')
+def api_version():
+    last_modified = None
+    if DATA_COMPUTED.exists():
+        last_modified = datetime.fromtimestamp(
+            DATA_COMPUTED.stat().st_mtime
+        ).isoformat()
+    return {
+        'app_version': '3.0.0',
+        'phase': 'Faz 3 — Admin Upload UI',
+        'has_data': DATA_COMPUTED.exists(),
+        'data_last_modified': last_modified,
+    }
+
+
+# ============================================================
+# Admin: coverage matrix
+# ============================================================
+@app.get('/api/admin/coverage')
+def admin_coverage(_: str = Depends(require_admin_perm('admin_veri'))):
+    """
+    Banka × çeyrek var/yok matrisi.
+
+    Dönüş:
+    {
+      'banks': ['Kuveyt Türk', 'Akbank', ...],
+      'quarters': ['2013-12-31', '2014-03-31', ...],
+      'matrix': {'Kuveyt Türk': {'2025-09-30': True, ...}},
+      'summary': {
+        'total_banks': 27,
+        'latest_quarter': '2025-09-30',
+        'banks_with_latest': 19,
+        'banks_missing_latest': ['Banka X', ...],
+        'total_cells': 1296,
+        'filled_cells': 1180,
+        'fill_rate': 0.91,
+      },
+      'last_updated': '2026-05-02T14:00:00'
+    }
+    """
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(status_code=503, detail='computed.json yok')
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=503, detail='catalog.json yok')
+
+    with open(DATA_CATALOG, encoding='utf-8') as f:
+        catalog = json.load(f)
+    with open(DATA_COMPUTED, encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Sadece gerçek bankalar (grup değil)
+    GROUP_NAMES = {'Sektör', 'Mevduat Sektörü', 'Katılım'}
+    banks = [b['banka_adi'] for b in catalog['banks']
+             if b['banka_adi'] not in GROUP_NAMES]
+
+    # Quarters: en yaygın referans olarak 'toplam_aktifler' kullan
+    bank_data = data.get('bank_data', {})
+    ref_measure = 'toplam_aktifler'
+    quarters_set = set()
+    for banka in banks:
+        if banka in bank_data.get(ref_measure, {}):
+            quarters_set.update(bank_data[ref_measure][banka].keys())
+    quarters = sorted(quarters_set)
+
+    # Matrix: hangi banka × çeyrekte değer var/yok
+    matrix = {}
+    for banka in banks:
+        bank_q = bank_data.get(ref_measure, {}).get(banka, {})
+        matrix[banka] = {q: bank_q.get(q) is not None for q in quarters}
+
+    # Summary
+    latest = quarters[-1] if quarters else None
+    banks_with_latest = [b for b in banks if matrix[b].get(latest, False)]
+    banks_missing_latest = [b for b in banks if not matrix[b].get(latest, False)]
+
+    # Beklenen çeyrek = latest + 3 ay (ör. 2025-09-30 → 2025-12-31)
+    expected = None
+    banks_with_expected = []
+    banks_missing_expected = []
+    if latest:
+        from datetime import date
+        y, m, d = map(int, latest.split('-'))
+        # Çeyrek sonları: Mart 31, Haziran 30, Eylül 30, Aralık 31
+        next_q = {3: (6, 30), 6: (9, 30), 9: (12, 31), 12: (3, 31)}
+        nm, nd = next_q.get(m, (12, 31))
+        ny = y + 1 if m == 12 else y
+        expected = f'{ny:04d}-{nm:02d}-{nd:02d}'
+
+        # Bekleyen çeyreğin matrix'te kaydı var mı (genelde yok, henüz hiç yüklenmemiş)
+        # Eğer var ise, hangi bankalar yüklemiş hangisi yüklememiş hesapla
+        for b in banks:
+            bank_q = bank_data.get(ref_measure, {}).get(b, {})
+            if bank_q.get(expected) is not None:
+                banks_with_expected.append(b)
+            else:
+                banks_missing_expected.append(b)
+
+    total = len(banks) * len(quarters)
+    filled = sum(sum(1 for v in m.values() if v) for m in matrix.values())
+
+    last_modified = None
+    if DATA_COMPUTED.exists():
+        last_modified = datetime.fromtimestamp(
+            DATA_COMPUTED.stat().st_mtime
+        ).isoformat()
+
+    return {
+        'banks': banks,
+        'quarters': quarters,
+        'matrix': matrix,
+        # Açılışta computed.json bozuk bulunup yedekten geri yüklendiyse
+        # admin panelde uyarı gösterilir (2026-09-08).
+        'recovery_notice': _RECOVERY_NOTICE,
+        'summary': {
+            'total_banks': len(banks),
+            'latest_quarter': latest,
+            'banks_with_latest': len(banks_with_latest),
+            'banks_missing_latest': banks_missing_latest,
+            'expected_quarter': expected,
+            'banks_with_expected': len(banks_with_expected),
+            'banks_missing_expected': banks_missing_expected,
+            'total_cells': total,
+            'filled_cells': filled,
+            'fill_rate': filled / total if total else 0,
+        },
+        'last_updated': last_modified,
+    }
+
+
+# ============================================================
+# Admin: upload geçmişi
+# ============================================================
+@app.get('/api/admin/users')
+def admin_list_users(admin_id: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    """Tüm üyelik başvuruları (pending/approved/rejected) — sadece admin görür.
+    Ultra admin hesabı (2026-08-15) SIRADAN adminlerden gizlenir; yalnızca
+    ultra admin kendini ve herkesi görür."""
+    users = users_mod.list_users(DATA_USERS)
+    if ULTRA_ADMIN_EMAIL and not is_ultra_admin(admin_id):
+        users = [u for u in users
+                 if u.get('email', '').strip().lower() != ULTRA_ADMIN_EMAIL]
+    return {'users': list(reversed(users))}  # en yeni başvuru başta
+
+
+class AdminCreateUserPayload(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+@app.post('/api/admin/users')
+def admin_create_user(payload: AdminCreateUserPayload,
+                      admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    """Admin, self-signup + onay adımlarını atlayıp doğrudan ONAYLI bir üye
+    ekler (2026-09-09) — ör. yeni işe başlayan birine hemen erişim vermek
+    için. create_signup'la aynı doğrulamalar (kurumsal e-posta domaini,
+    şifre uzunluğu, tekil e-posta) geçerli."""
+    ok, err = users_mod.admin_create_user(
+        DATA_USERS, payload.name, payload.email, payload.password, admin_user,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    return {'status': 'ok'}
+
+
+@app.post('/api/admin/users/{user_id}/approve')
+def admin_approve_user(user_id: int, admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    _assert_can_target_user(user_id, admin_user)  # sıradan admin ultra'ya dokunamaz
+    _assert_can_manage(user_id, admin_user)       # onay da yetki yükseltmedir: kendi izinlerinden geniş rollü başvuruyu onaylayamaz
+    ok = users_mod.set_status(DATA_USERS, user_id, 'approved', admin_user)
+    if not ok:
+        raise HTTPException(status_code=404, detail='Kullanıcı bulunamadı')
+    return {'status': 'ok'}
+
+
+@app.post('/api/admin/users/{user_id}/reject')
+def admin_reject_user(user_id: int, admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    _assert_can_target_user(user_id, admin_user)  # sıradan admin ultra'ya dokunamaz
+    _assert_can_manage(user_id, admin_user)
+    ok = users_mod.set_status(DATA_USERS, user_id, 'rejected', admin_user)
+    if not ok:
+        raise HTTPException(status_code=404, detail='Kullanıcı bulunamadı')
+    return {'status': 'ok'}
+
+
+def _assert_can_manage(user_id: int, identity: str) -> None:
+    """Yetki yükseltmeyi önler (2026-09-30): kimse kendi izinlerinin dışında
+    izni olan bir kullanıcıyı (ör. "Kullanıcılar ve roller" izni olan ama veri
+    yükleyemeyen biri bir Admin'i) reddedemez, şifresini sıfırlayamaz, rolünü
+    değiştiremez."""
+    target = users_mod.get_user_by_id(DATA_USERS, user_id)
+    if target and not user_perms(target) <= identity_perms(identity):
+        raise HTTPException(status_code=403, detail='Sizden daha geniş yetkili bir kullanıcı üzerinde işlem yapamazsınız')
+
+
+class RolePayload(BaseModel):
+    role: str  # roles.json'daki rol kimliği
+
+
+@app.post('/api/admin/users/{user_id}/role')
+def admin_set_user_role(user_id: int, payload: RolePayload,
+                        admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    """Kullanıcıya rol ata (2026-09-30: rol bazlı). Verilen rolün izinleri
+    atayanın izinlerini aşamaz; kişi kendi rolünü değiştiremez (kilitlenme)."""
+    _assert_can_target_user(user_id, admin_user)  # sıradan admin ultra'nın rolüne dokunamaz
+    _assert_can_manage(user_id, admin_user)
+    target = users_mod.get_user_by_id(DATA_USERS, user_id)
+    if target and target['email'] == admin_user:
+        raise HTTPException(status_code=400, detail='Kendi rolünüzü değiştiremezsiniz')
+    if not roles_mod.exists(DATA_ROLES, payload.role):
+        raise HTTPException(status_code=400, detail='Geçersiz rol')
+    if not set(roles_mod.yetki_izinleri(roles_mod.get_role(DATA_ROLES, payload.role)['izinler'])) <= identity_perms(admin_user):
+        raise HTTPException(status_code=403, detail='Kendi izinlerinizden geniş bir rol atayamazsınız')
+    ok = users_mod.set_role(DATA_USERS, user_id, payload.role, DATA_ROLES)
+    if not ok:
+        raise HTTPException(status_code=400, detail='Geçersiz kullanıcı veya rol')
+    return {'status': 'ok'}
+
+
+# ============================================================
+# Roller (2026-09-30) — admin panelde "Roller" sekmesi. İzinler kutucuklarla
+# açılıp kapatılır; asistan günlük soru sınırı rol başına. Bkz. roles.py.
+# ============================================================
+class RoleDefPayload(BaseModel):
+    ad: str
+    izinler: List[str]
+    asistan_gunluk: int
+    olculer: Optional[List[str]] = None   # None = tüm ölçüler; liste = yalnız bu ölçüler (gönderilmezse güncellemede mevcut kısıt korunur)
+
+
+@app.get('/api/admin/roles')
+def admin_list_roles(admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    counts = users_mod.count_by_role(DATA_USERS)
+    roles = [dict(r, kullanici=counts.get(r['id'], 0)) for r in roles_mod.list_roles(DATA_ROLES)]
+    return {'roles': roles, 'izinler': roles_mod.catalog(), 'kategoriler': _gizlenebilir_kategoriler(),
+            'olcu_katalogu': [{'id': m['id'], 'ad': m.get('ad'), 'kategori': m.get('kategori'), 'alt': m.get('alt_kategori')}
+                              for m in (_load_catalog().get('measures') or [])],
+            # Ekran izinleri salt-görünümdür (yetki sayılmaz) ama her rolde bulunur; panel "bu rolü düzenleyebilir miyim" kontrolünde
+            # onları da sahip say, yoksa üye oturumlu admin tüm rolleri kilitli görür.
+            'benim_izinlerim': sorted(identity_perms(admin_user) | set(roles_mod.EKRAN_IZINLERI))}
+
+
+def _assert_perms_subset(izinler: List[str], identity: str) -> None:
+    if not set(roles_mod.yetki_izinleri(izinler)) <= identity_perms(identity):
+        raise HTTPException(status_code=403, detail='Kendi izinlerinizden geniş bir rol tanımlayamazsınız')
+
+
+@app.post('/api/admin/roles')
+def admin_create_role(payload: RoleDefPayload,
+                      admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    _assert_perms_subset(payload.izinler, admin_user)
+    role, err = roles_mod.create_role(DATA_ROLES, payload.ad, payload.izinler, payload.asistan_gunluk, payload.olculer)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    return {'status': 'ok', 'role': role}
+
+
+@app.put('/api/admin/roles/{role_id}')
+def admin_update_role(role_id: str, payload: RoleDefPayload,
+                      admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    mine = identity_perms(admin_user)
+    if roles_mod.exists(DATA_ROLES, role_id) and not set(roles_mod.yetki_izinleri(roles_mod.get_role(DATA_ROLES, role_id)['izinler'])) <= mine:
+        raise HTTPException(status_code=403, detail='Sizden daha geniş yetkili bir rolü düzenleyemezsiniz')
+    _assert_perms_subset(payload.izinler, admin_user)
+    olculer = payload.olculer if 'olculer' in payload.model_fields_set else roles_mod._YOK
+    role, err = roles_mod.update_role(DATA_ROLES, role_id, payload.ad, payload.izinler, payload.asistan_gunluk, olculer)
+    if err:
+        raise HTTPException(status_code=404 if err == 'Rol bulunamadı' else 400, detail=err)
+    return {'status': 'ok', 'role': role}
+
+
+@app.delete('/api/admin/roles/{role_id}')
+def admin_delete_role(role_id: str, admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    in_use = users_mod.count_by_role(DATA_USERS).get(role_id, 0)
+    ok, err = roles_mod.delete_role(DATA_ROLES, role_id, in_use)
+    if not ok:
+        raise HTTPException(status_code=404 if err == 'Rol bulunamadı' else 400, detail=err)
+    return {'status': 'ok'}
+
+
+@app.get('/api/admin/me')
+def admin_me(admin_user: str = Depends(require_admin_access)):
+    """Admin panelinin hangi sekmeleri göstereceği (Basic Auth kökü: hepsi)."""
+    return {'kimlik': admin_user, 'izinler': sorted(identity_perms(admin_user)),
+            'tam_admin': _tam_admin_mi(admin_user)}
+
+
+def _tam_admin_mi(identity: str) -> bool:
+    """Basic Auth kökü ya da rolü Admin olan üye. Sır yönetimi (API anahtarları)
+    gibi tek tek izinle verilemeyecek işler için."""
+    if identity == USERNAME:
+        return True
+    user = users_mod.get_user_by_email(DATA_USERS, identity)
+    return bool(user) and roles_mod.resolve_id(DATA_ROLES, user.get('role')) == roles_mod.ADMIN_ROL
+
+
+def require_tam_admin(identity: str = Depends(require_admin_access)) -> str:
+    if not _tam_admin_mi(identity):
+        raise HTTPException(status_code=403, detail='Bu işlem yalnız Admin rolüne açık')
+    return identity
+
+
+class AsistanAnahtarPayload(BaseModel):
+    degerler: Dict[str, Optional[str]]
+
+
+def _asistan_anahtar_yaniti() -> dict:
+    cfg = assistant_llm.LLMConfig.from_env()
+    return {'anahtarlar': asistan_anahtarlar.durum(DATA_ASISTAN_ANAHTAR),
+            'asistan_acik': cfg is not None, 'model': cfg.model if cfg else None}
+
+
+@app.get('/api/admin/asistan-anahtarlari')
+def admin_asistan_anahtarlari(admin_user: str = Depends(require_tam_admin)):
+    """Anahtarların kaynağı (panel / sunucu / yok) ve maskeli hali — düz değer dönmez."""
+    return _asistan_anahtar_yaniti()
+
+
+@app.put('/api/admin/asistan-anahtarlari')
+def admin_asistan_anahtarlari_kaydet(payload: AsistanAnahtarPayload,
+                                     admin_user: str = Depends(require_tam_admin)):
+    """Değer verilen anahtarı kaydeder, boş/null verileni panelden siler (sunucu
+    ortamındaki değer varsa o geri gelir). Yeniden başlatma gerekmez."""
+    hata = asistan_anahtarlar.kaydet(DATA_ASISTAN_ANAHTAR, payload.degerler)
+    if hata:
+        raise HTTPException(status_code=400, detail=hata)
+    degisen = ', '.join(sorted(payload.degerler))
+    print(f'[admin] {admin_user} asistan anahtarlarını güncelledi: {degisen}', flush=True)
+    return _asistan_anahtar_yaniti()
+
+
+class AdminResetPasswordPayload(BaseModel):
+    new_password: str
+
+
+@app.post('/api/admin/users/{user_id}/reset-password')
+def admin_reset_user_password(user_id: int, payload: AdminResetPasswordPayload,
+                              admin_user: str = Depends(require_admin_perm('admin_kullanicilar'))):
+    """Admin, şifresini unutan bir üyeye YENİ şifre atar — üyenin mevcut
+    şifresini bilmesine gerek yok (2026-09-09, ör. Berkan Keskin talebi).
+    change_password'dan farkı bu: orada üye kendi mevcut şifresini
+    doğrulamak zorunda, burada admin doğrudan atıyor."""
+    _assert_can_target_user(user_id, admin_user)  # sıradan admin ultra'nın şifresini sıfırlayamaz
+    _assert_can_manage(user_id, admin_user)
+    target = users_mod.get_user_by_id(DATA_USERS, user_id)
+    if target and target.get('email', '').strip().lower().endswith('@admin.local'):
+        raise HTTPException(
+            status_code=400,
+            detail='Bu hesabın şifresi sunucu yapılandırmasından (start.sh → KT_PASSWORD) yönetilir.',
+        )
+    ok, err = users_mod.admin_reset_password(DATA_USERS, user_id, payload.new_password)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    return {'status': 'ok'}
+
+
+@app.get('/api/admin/history')
+def admin_history(limit: int = 20, _: str = Depends(require_admin_perm('admin_veri'))):
+    """Son N upload kaydı."""
+    if not DATA_HISTORY.exists():
+        return {'uploads': []}
+    try:
+        with open(DATA_HISTORY, encoding='utf-8') as f:
+            history = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        history = {'uploads': []}
+    uploads = history.get('uploads', [])[-limit:]
+    return {'uploads': list(reversed(uploads))}  # en yeni başta
+
+
+def _append_history(entry: dict):
+    """Upload geçmişine kayıt ekle (atomik)."""
+    try:
+        if DATA_HISTORY.exists():
+            with open(DATA_HISTORY, encoding='utf-8') as f:
+                hist = json.load(f)
+        else:
+            hist = {'uploads': []}
+    except (json.JSONDecodeError, OSError):
+        hist = {'uploads': []}
+
+    hist.setdefault('uploads', []).append(entry)
+    # Son 200 kaydı tut, eski olanları kırp
+    hist['uploads'] = hist['uploads'][-200:]
+
+    tmp = DATA_HISTORY.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(hist, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(DATA_HISTORY)
+
+
+# ============================================================
+# Banka grupları yönetimi (2026-08-12) — catalog.json'daki groups.members'ı
+# admin panelinden düzenlemeyi sağlar (ör. "Rakip Bankalar" üyeliği).
+# Tek, ORTAK set — herkesin dashboard'unda aynı görünür (kişiye özel değil,
+# kullanıcı bu şekilde istedi).
+# ============================================================
+
+def _load_catalog() -> dict:
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=500, detail='catalog.json yok')
+    with open(DATA_CATALOG, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _save_catalog(catalog: dict) -> None:
+    tmp = DATA_CATALOG.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(DATA_CATALOG)
+
+
+def _recompute_groups_and_save(catalog: dict) -> None:
+    """
+    Grup üyeliği değiştiğinde SADECE group_data + composition_data'yı
+    yeniden hesaplar (bank_data'ya DOKUNMAZ) — tam rebuild'in (~50sn,
+    1176 xlsx'i yeniden okur) aksine sadece parquet'i okuyup mevcut
+    bank_data üzerinden agregasyon yapar (~5-10sn). meta.group_order/
+    meta.groups/meta.group_colors da (bunlar 'statik' kabul edilip
+    normal rebuild'lerde korunuyordu — bkz. _rebuild_dynamic_meta
+    yorumu) YENİ catalog'dan güncellenir, aksi halde yeni oluşturulan
+    bir grup dashboard'da hiç görünmezdi.
+    """
+    from pipeline import LookupContext, build_group_data
+    from pipeline.composition import build_composition_payload
+
+    bank_turu_map = {b['banka_adi']: b['tur'] for b in catalog['banks']}
+    ctx = LookupContext.from_parquet(DATA_PARQUET, bank_turu_map)
+
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(status_code=500, detail='computed.json yok — önce /admin/rebuild çalıştırın')
+    with open(DATA_COMPUTED, encoding='utf-8') as f:
+        computed = json.load(f)
+
+    bank_data = computed.get('bank_data', {})
+    group_data = build_group_data(bank_data, catalog, ctx)
+    composition_data, currency_data = build_composition_payload(ctx, catalog)
+
+    meta = computed.get('meta', {})
+    meta['group_order'] = catalog['groups']['order']
+    meta['group_colors'] = catalog['groups']['colors']
+    meta['groups'] = catalog['groups']['members']
+    meta['focus_bank'] = focus_of(catalog)
+    now_ts = datetime.now().isoformat()
+    meta['timestamp'] = now_ts
+
+    computed['meta'] = meta
+    computed['group_data'] = group_data
+    computed['composition_data'] = composition_data
+    computed['currency_data'] = currency_data
+    computed['timestamp'] = now_ts
+    _write_computed(computed)
+
+
+class GroupMembersPayload(BaseModel):
+    members: List[str]
+
+
+class GroupCreatePayload(BaseModel):
+    name: str
+    members: List[str]
+    color: Optional[str] = None
+
+
+PROTECTED_GROUPS = {'Kuveyt Türk'}  # varsayılan odak grubu; gerçek korumalı grup = odak banka (bkz. focus_of)
+
+
+@app.get('/api/admin/groups')
+def admin_list_groups(_: str = Depends(require_admin_perm('admin_gruplar'))):
+    catalog = _load_catalog()
+    real_banks = sorted(b['banka_adi'] for b in catalog['banks'] if b['tur'] != 'Grup')
+    groups = catalog.get('groups', {})
+    return {
+        'order': groups.get('order', []),
+        'members': groups.get('members', {}),
+        'colors': groups.get('colors', {}),
+        'all_banks': real_banks,
+        'focus': focus_of(catalog),
+        'protected': [focus_of(catalog)],
+    }
+
+
+@app.put('/api/admin/groups/{group_name}')
+def admin_update_group(group_name: str, payload: GroupMembersPayload, _: str = Depends(require_admin_perm('admin_gruplar'))):
+    catalog = _load_catalog()
+    groups = catalog.setdefault('groups', {'order': [], 'members': {}, 'colors': {}})
+    if group_name not in groups.get('members', {}):
+        raise HTTPException(status_code=404, detail='Grup bulunamadı')
+    real_banks = set(b['banka_adi'] for b in catalog['banks'] if b['tur'] != 'Grup')
+    invalid = [m for m in payload.members if m not in real_banks]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f'Geçersiz banka(lar): {invalid}')
+    if not payload.members:
+        raise HTTPException(status_code=400, detail='Grup en az 1 üye içermeli')
+    groups['members'][group_name] = payload.members
+    _save_catalog(catalog)
+    _recompute_groups_and_save(catalog)
+    return {'status': 'ok'}
+
+
+@app.post('/api/admin/groups')
+def admin_create_group(payload: GroupCreatePayload, _: str = Depends(require_admin_perm('admin_gruplar'))):
+    catalog = _load_catalog()
+    groups = catalog.setdefault('groups', {'order': [], 'members': {}, 'colors': {}})
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail='Grup adı boş olamaz')
+    if name in groups.get('members', {}):
+        raise HTTPException(status_code=400, detail='Bu isimde bir grup zaten var')
+    real_banks = set(b['banka_adi'] for b in catalog['banks'] if b['tur'] != 'Grup')
+    invalid = [m for m in payload.members if m not in real_banks]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f'Geçersiz banka(lar): {invalid}')
+    if not payload.members:
+        raise HTTPException(status_code=400, detail='Grup en az 1 üye içermeli')
+    groups.setdefault('order', []).append(name)
+    groups.setdefault('members', {})[name] = payload.members
+    groups.setdefault('colors', {})[name] = payload.color or '#64748b'
+    _save_catalog(catalog)
+    _recompute_groups_and_save(catalog)
+    return {'status': 'ok'}
+
+
+# ------------------------------------------------------------------
+# EVDS seri kataloğu (2026-10-02): asistanın seri araması data/evds_katalog.json'dan yapılır.
+# Katalog TCMB'nin yayımladığı serilerle birlikte eskir; yeni seri/baz yılı için yenilenir.
+# ------------------------------------------------------------------
+_EVDS_KATALOG_DURUM: Dict[str, Any] = {'calisiyor': False, 'ilerleme': None, 'hata': None, 'bitis': None}
+
+
+@app.get('/api/admin/evds-katalog')
+def admin_evds_katalog_durum(_: str = Depends(require_admin_perm('admin_veri'))):
+    from assistant.external import evds, evds_katalog
+    return {'katalog': evds_katalog.ozet(), 'evds_etkin': evds.enabled(), **_EVDS_KATALOG_DURUM}
+
+
+@app.post('/api/admin/evds-katalog/guncelle')
+def admin_evds_katalog_guncelle(_: str = Depends(require_admin_perm('admin_veri'))):
+    """EVDS kataloğunu arka planda yeniden çeker (~3-5 dk, 700 istek); ilerleme GET ile izlenir."""
+    import threading
+    from assistant.external import evds, evds_katalog
+    if not evds.enabled():
+        raise HTTPException(status_code=400, detail='EVDS_API_KEY tanımlı değil')
+    if _EVDS_KATALOG_DURUM['calisiyor']:
+        raise HTTPException(status_code=409, detail='Katalog güncellemesi zaten çalışıyor')
+
+    def is_():
+        try:
+            kat = evds_katalog.olustur(lambda i, n: _EVDS_KATALOG_DURUM.update(ilerleme=f'{i}/{n}'))
+            evds_katalog.kaydet(kat)
+            _EVDS_KATALOG_DURUM.update(hata=None)
+        except Exception as e:  # noqa: BLE001
+            _EVDS_KATALOG_DURUM.update(hata=str(e)[:300])
+        finally:
+            _EVDS_KATALOG_DURUM.update(calisiyor=False, bitis=datetime.now().isoformat(timespec='seconds'))
+    _EVDS_KATALOG_DURUM.update(calisiyor=True, ilerleme='0/?', hata=None)
+    threading.Thread(target=is_, daemon=True).start()
+    return {'status': 'basladi'}
+
+
+class FocusBankPayload(BaseModel):
+    bank: str
+    rakipler: Optional[List[str]] = None   # 2026-10-03: yeni odak için Rakip Bankalar (yapay zeka önerisi / seçim)
+
+
+@app.put('/api/admin/focus-bank')
+def admin_set_focus_bank(payload: FocusBankPayload, _: str = Depends(require_admin_perm('admin_gruplar'))):
+    """Odak bankayı değiştirir (varsayılan Kuveyt Türk): grup yapısı yeni bankaya göre kurulur,
+    grup değerleri yeniden hesaplanır; arayüz meta.focus_bank üzerinden odağı değiştirir."""
+    catalog = _load_catalog()
+    try:
+        sonuc = apply_focus_bank(catalog, payload.bank.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    rakipler = rakipleri_normalle(catalog, sonuc['odak'], payload.rakipler)
+    if rakipler:
+        ek = set_rakipler(catalog, rakipler)
+        if ek:
+            sonuc = dict(sonuc, degisti=True, degisiklikler=list(sonuc.get('degisiklikler') or []) + ek)
+    if not sonuc.get('degisti'):
+        return {'status': 'ok', **sonuc}
+    _save_catalog(catalog)
+    _recompute_groups_and_save(catalog)
+    return {'status': 'ok', **sonuc}
+
+
+@app.delete('/api/admin/groups/{group_name}')
+def admin_delete_group(group_name: str, _: str = Depends(require_admin_perm('admin_gruplar'))):
+    catalog = _load_catalog()
+    if group_name == focus_of(catalog):
+        raise HTTPException(status_code=400, detail=f"'{group_name}' odak banka grubudur, silinemez (önce odak bankayı değiştirin)")
+    groups = catalog.get('groups', {})
+    if group_name not in groups.get('members', {}):
+        raise HTTPException(status_code=404, detail='Grup bulunamadı')
+    groups['members'].pop(group_name, None)
+    groups.get('colors', {}).pop(group_name, None)
+    if group_name in groups.get('order', []):
+        groups['order'].remove(group_name)
+    _save_catalog(catalog)
+    _recompute_groups_and_save(catalog)
+    return {'status': 'ok'}
+
+
+# ============================================================
+# GÖREV PANOSU (Jira tarzı kanban) — admin-only, 2026-09-22
+# ============================================================
+# Kartlar sütun sütun LİSTE olarak saklanır (her sütun kendi sırasını taşır) —
+# kartların üzerinde ayrı bir "sıra" alanı tutup her taşımada yeniden
+# numaralandırmaya gerek kalmıyor, taşıma = listeden çıkar + hedefe ekle.
+# Sütunlar: To Do ('yapilacak') → In Progress ('planlanan', veri uyumu için eski kimlik) → To Check ('kontrol') → Done ('yapildi').
+# Eski board.json'da 'kontrol' anahtarı yoksa boş sütun olarak yüklenir.
+BOARD_COLUMNS = ['yapilacak', 'planlanan', 'kontrol', 'yapildi']
+
+
+def _empty_board() -> dict:
+    return {'columns': {c: [] for c in BOARD_COLUMNS}}
+
+
+def _load_board() -> dict:
+    if not DATA_BOARD.exists():
+        return _empty_board()
+    try:
+        with open(DATA_BOARD, encoding='utf-8') as f:
+            board = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return _empty_board()
+    cols = board.get('columns') or {}
+    return {'columns': {c: list(cols.get(c, [])) for c in BOARD_COLUMNS}}
+
+
+def _save_board(board: dict) -> None:
+    tmp = DATA_BOARD.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(board, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(DATA_BOARD)
+
+
+def _find_card(board: dict, card_id: str):
+    """(sütun_adı, index) döner, bulunamazsa (None, None)."""
+    for col in BOARD_COLUMNS:
+        for i, card in enumerate(board['columns'][col]):
+            if card.get('id') == card_id:
+                return col, i
+    return None, None
+
+
+class BoardCardPayload(BaseModel):
+    baslik: str
+    aciklama: Optional[str] = ''
+    oncelik: str = 'orta'
+    etiket: Optional[str] = ''
+    durum: str = 'yapilacak'
+
+
+class BoardCardUpdatePayload(BaseModel):
+    baslik: Optional[str] = None
+    aciklama: Optional[str] = None
+    oncelik: Optional[str] = None
+    etiket: Optional[str] = None
+
+
+class BoardMovePayload(BaseModel):
+    durum: str
+    index: Optional[int] = None
+
+
+@app.get('/api/admin/board')
+def admin_board_list(_: str = Depends(require_admin_perm('admin_proje'))):
+    return _load_board()
+
+
+@app.post('/api/admin/board/cards')
+def admin_board_create(payload: BoardCardPayload, user: str = Depends(require_admin_perm('admin_proje'))):
+    baslik = (payload.baslik or '').strip()
+    if not baslik:
+        raise HTTPException(status_code=400, detail='Başlık boş olamaz')
+    if payload.durum not in BOARD_COLUMNS:
+        raise HTTPException(status_code=400, detail='Geçersiz sütun')
+    board = _load_board()
+    now = datetime.now().isoformat(timespec='seconds')
+    card = {
+        'id': uuid.uuid4().hex[:12],
+        'baslik': baslik,
+        'aciklama': (payload.aciklama or '').strip(),
+        'oncelik': payload.oncelik if payload.oncelik in ('yuksek', 'orta', 'dusuk') else 'orta',
+        'etiket': (payload.etiket or '').strip(),
+        'created_at': now,
+        'updated_at': now,
+        'created_by': user,
+    }
+    board['columns'][payload.durum].append(card)
+    _save_board(board)
+    return {'status': 'ok', 'card': card}
+
+
+@app.put('/api/admin/board/cards/{card_id}')
+def admin_board_update(card_id: str, payload: BoardCardUpdatePayload,
+                       _: str = Depends(require_admin_perm('admin_proje'))):
+    board = _load_board()
+    col, idx = _find_card(board, card_id)
+    if col is None:
+        raise HTTPException(status_code=404, detail='Kart bulunamadı')
+    card = board['columns'][col][idx]
+    if payload.baslik is not None:
+        baslik = payload.baslik.strip()
+        if not baslik:
+            raise HTTPException(status_code=400, detail='Başlık boş olamaz')
+        card['baslik'] = baslik
+    if payload.aciklama is not None:
+        card['aciklama'] = payload.aciklama.strip()
+    if payload.oncelik is not None and payload.oncelik in ('yuksek', 'orta', 'dusuk'):
+        card['oncelik'] = payload.oncelik
+    if payload.etiket is not None:
+        card['etiket'] = payload.etiket.strip()
+    card['updated_at'] = datetime.now().isoformat(timespec='seconds')
+    _save_board(board)
+    return {'status': 'ok', 'card': card}
+
+
+@app.post('/api/admin/board/cards/{card_id}/move')
+def admin_board_move(card_id: str, payload: BoardMovePayload,
+                     _: str = Depends(require_admin_perm('admin_proje'))):
+    if payload.durum not in BOARD_COLUMNS:
+        raise HTTPException(status_code=400, detail='Geçersiz sütun')
+    board = _load_board()
+    col, idx = _find_card(board, card_id)
+    if col is None:
+        raise HTTPException(status_code=404, detail='Kart bulunamadı')
+    card = board['columns'][col].pop(idx)
+    target = board['columns'][payload.durum]
+    pos = len(target) if payload.index is None else max(0, min(payload.index, len(target)))
+    target.insert(pos, card)
+    card['updated_at'] = datetime.now().isoformat(timespec='seconds')
+    _save_board(board)
+    return {'status': 'ok'}
+
+
+@app.delete('/api/admin/board/cards/{card_id}')
+def admin_board_delete(card_id: str, _: str = Depends(require_admin_perm('admin_proje'))):
+    board = _load_board()
+    col, idx = _find_card(board, card_id)
+    if col is None:
+        raise HTTPException(status_code=404, detail='Kart bulunamadı')
+    board['columns'][col].pop(idx)
+    _save_board(board)
+    return {'status': 'ok'}
+
+
+def _result_period_count(bank_data: dict) -> int:
+    """Hesaplanan bank_data'da kaç (banka × tarih) hücresi dolu — boşluk kontrolü için."""
+    ta = (bank_data or {}).get('toplam_aktifler', {})
+    return sum(len(series) for series in ta.values())
+
+
+# ============================================================
+# computed.json sağlamlaştırma (2026-09-08)
+# ============================================================
+# İki katman: (1) yazım öncesi REGRESYON KİLİDİ — yeni sonuç mevcut veriden
+# küçükse diske yazma; (2) açılışta BOZUKLUK TESPİTİ — computed.json
+# okunamıyorsa son sağlam yedeğe dön (bkz. _recover_computed_if_corrupt).
+#
+# Neden: _assert_nonempty_result yalnızca sonucun TAMAMEN boş olmasını
+# yakalıyordu. 2026-08-19'daki kazada rebuild, 51 dönemlik geçmişi silip
+# yerine 1 dönem yazdı — sonuç boş DEĞİLDİ, bu yüzden kilidi geçti ve
+# canlı veri kayboldu. Regresyon kilidi tam bu boşluğu kapatır.
+
+def _computed_metrics(bank_data: dict) -> dict:
+    """Bir bank_data'nın "büyüklük" parmak izi — regresyon kıyaslaması için."""
+    ta = (bank_data or {}).get('toplam_aktifler', {}) or {}
+    dolu = 0
+    for series in (bank_data or {}).values():
+        if isinstance(series, dict):
+            for s2 in series.values():
+                if isinstance(s2, dict):
+                    dolu += sum(1 for v in s2.values() if v is not None)
+    tarihler = {t for s in ta.values() if isinstance(s, dict)
+                for t, v in s.items() if v is not None}
+    return {
+        'olcu': len(bank_data or {}),
+        'banka': len(ta),
+        'donem': len(tarihler),
+        'dolu_hucre': dolu,
+    }
+
+
+# Dolu hücre sayısında küçük dalgalanmalara izin verilir (bir measure'ın
+# birkaç hücresi None dönebilir); ölçü/banka/dönem sayısında tolerans YOK —
+# bunların azalması her zaman veri kaybı demektir.
+_REGRESSION_CELL_TOLERANCE = 0.98
+
+
+def _assert_no_regression(new_bank_data: dict, force: bool = False) -> dict:
+    """REGRESYON KİLİDİ: yeni sonuç mevcut computed.json'dan küçükse yazma.
+
+    force=True ile atlanabilir (admin panelde açık onay kutusu) — meşru
+    küçülmeler için (ör. hatalı bir bankanın verisinin bilinçli silinmesi).
+    Dönüş: karşılaştırma özeti (yanıtta raporlanır).
+    """
+    if not DATA_COMPUTED.exists():
+        return {'skipped': 'mevcut computed.json yok'}
+    try:
+        with open(DATA_COMPUTED, encoding='utf-8') as f:
+            eski = json.load(f).get('bank_data', {})
+    except (json.JSONDecodeError, OSError) as e:
+        # Mevcut dosya zaten okunamıyorsa kıyaslayacak taban yok; yeni veriyi
+        # yazmak durumu iyileştirir, engelleme.
+        return {'skipped': f'mevcut computed.json okunamadı: {e}'}
+
+    onceki, simdiki = _computed_metrics(eski), _computed_metrics(new_bank_data)
+    kayiplar = []
+    for alan in ('olcu', 'banka', 'donem'):
+        if simdiki[alan] < onceki[alan]:
+            kayiplar.append(f"{alan}: {onceki[alan]} -> {simdiki[alan]}")
+    if simdiki['dolu_hucre'] < onceki['dolu_hucre'] * _REGRESSION_CELL_TOLERANCE:
+        kayiplar.append(f"dolu_hucre: {onceki['dolu_hucre']:,} -> {simdiki['dolu_hucre']:,}")
+
+    ozet = {'onceki': onceki, 'simdiki': simdiki, 'kayiplar': kayiplar,
+            'zorlandi': bool(force and kayiplar)}
+    if kayiplar and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=('VERİ KAYBI ENGELLENDİ — yeni hesaplama mevcut veriden küçük, '
+                    'yazma iptal edildi ve mevcut veri KORUNDU. Azalanlar: '
+                    + '; '.join(kayiplar)
+                    + '. Bu azalma bilinçliyse admin panelde "Veri azalmasına izin ver" '
+                      'kutusunu işaretleyip tekrar deneyin.'),
+        )
+    if kayiplar:
+        print(f"[regresyon] UYARI: kilit ZORLANDI, veri azalıyor: {kayiplar}")
+    return ozet
+
+
+def _validate_computed_payload(d: dict) -> tuple[bool, str]:
+    """computed.json şema/bütünlük kontrolü — kurtarma kararı için."""
+    if not isinstance(d, dict):
+        return False, 'kök nesne dict değil'
+    bd = d.get('bank_data')
+    if not isinstance(bd, dict) or not bd:
+        return False, 'bank_data yok veya boş'
+    if _computed_metrics(bd)['dolu_hucre'] == 0:
+        return False, 'bank_data içinde hiç dolu hücre yok'
+    if not d.get('catalog'):
+        return False, 'catalog yok'
+    if not isinstance(d.get('meta'), dict):
+        return False, 'meta yok'
+    return True, 'ok'
+
+
+# Açılışta kurtarma yapıldıysa admin panelde gösterilecek uyarı (in-memory).
+_RECOVERY_NOTICE: Optional[str] = None
+
+
+def _recover_computed_if_corrupt() -> None:
+    """Açılışta computed.json okunamıyor/bozuksa son SAĞLAM yedeğe döner.
+
+    Eskiden bozuk bir computed.json (yarım yazım, disk dolması) tüm
+    dashboard'ı çökertiyordu ve elle müdahale gerekiyordu. Artık bozuk dosya
+    `computed.corrupt_<zaman>.json` olarak saklanır (inceleme için),
+    yerine `data/backups/` içindeki en yeni sağlam yedek konur.
+    """
+    global _RECOVERY_NOTICE
+    if not DATA_COMPUTED.exists():
+        return
+    try:
+        with open(DATA_COMPUTED, encoding='utf-8') as f:
+            ok, sebep = _validate_computed_payload(json.load(f))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        ok, sebep = False, f'okunamadı: {type(e).__name__}: {e}'
+    if ok:
+        return
+
+    print(f"[kurtarma] computed.json BOZUK ({sebep}) — yedek aranıyor")
+    adaylar = sorted(DATA_BACKUPS.glob('computed_*.json'), reverse=True)
+    for aday in adaylar:
+        try:
+            with open(aday, encoding='utf-8') as f:
+                iyi, _ = _validate_computed_payload(json.load(f))
+        except Exception:
+            continue
+        if not iyi:
+            continue
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        try:
+            shutil.move(str(DATA_COMPUTED), str(DATA_DIR / f'computed.corrupt_{ts}.json'))
+            shutil.copy2(aday, DATA_COMPUTED)
+        except OSError as e:
+            print(f"[kurtarma] BAŞARISIZ: {e}")
+            return
+        _RECOVERY_NOTICE = (
+            f'computed.json bozuktu ({sebep}) ve otomatik olarak "{aday.name}" '
+            f'yedeğinden geri yüklendi. Bozuk dosya computed.corrupt_{ts}.json '
+            f'olarak saklandı. Bu yedek tarihinden SONRAKİ yüklemeler kayıp '
+            f'olabilir — veri durumunu kontrol edip gerekirse son çeyreği '
+            f'yeniden yükleyin.'
+        )
+        print(f"[kurtarma] {aday.name} yedeğinden geri yüklendi")
+        return
+    _RECOVERY_NOTICE = (f'computed.json bozuk ({sebep}) ve geri yüklenebilecek '
+                        f'sağlam bir yedek bulunamadı. Veri yeniden yüklenmeli.')
+    print('[kurtarma] sağlam yedek YOK')
+
+
+# computed.json bozuksa son sağlam yedeğe dön. ensure_data_dir() içinden
+# DEĞİL buradan çağrılır: o fonksiyon modülün başında, bu yardımcılar
+# tanımlanmadan önce çalışıyor. Sadece ana süreçte (worker'larda değil) —
+# bkz. yukarıdaki MainProcess notu.
+if multiprocessing.current_process().name == 'MainProcess':
+    _recover_computed_if_corrupt()
+
+
+def _assert_nonempty_result(bank_data: dict):
+    """GÜVENLİK KİLİDİ: Hesaplama boş sonuç verdiyse yazma — mevcut veriyi koru.
+
+    Faz 4 bug'ı: rebuild boş data/raw veya banks=None ile boş bank_data üretip
+    canlı computed.json'u sıfırlamıştı. Bu kilit, boş/şüpheli sonucun diske
+    yazılmasını engeller (atomik yazımdan ÖNCE çağrılmalı).
+    """
+    n = _result_period_count(bank_data)
+    if n == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=('Hesaplama boş sonuç verdi (toplam_aktifler için 0 dönem). '
+                    'Mevcut veri KORUNDU, yazma iptal edildi. '
+                    'Olası neden: data/raw boş ya da parquet eksik.'),
+        )
+
+
+def _rebuild_dynamic_meta(meta: dict, bank_data: dict, catalog: dict) -> dict:
+    """meta'nın DİNAMİK alanlarını hesaplanan bank_data'dan yeniden üretir.
+
+    Statik alanlar (banks, groups, group_order, group_colors, kt_ramp,
+    neutral_ramp, accent) carried meta'dan korunur.
+    Dinamik alanlar (dates, total_periods, bank_coverage, top20_by_date,
+    available_measures) her zaman gerçek veriden türetilir — böylece meta
+    asla bank_data ile tutarsız / boş kalmaz.
+
+    compositions: catalog.json'dan TAZELENİR (source of truth). 2026-08-15
+    fix'i öncesi carried meta'dan korunuyordu → catalog.json'da kompozisyon
+    düzenlemesi (ör. pasif bileşeni Mevduat Dışı Kaynaklar → Alınan Krediler)
+    rebuild'de hiç yansımıyor, meta ile composition_data uyuşmuyordu.
+    """
+    meta = dict(meta or {})
+
+    # compositions: catalog source-of-truth (bkz. docstring + datatable.py)
+    if catalog.get('compositions'):
+        meta['compositions'] = catalog['compositions']
+    real_banks = [b['banka_adi'] for b in catalog.get('banks', [])]
+    real_set = set(real_banks)
+    ta = bank_data.get('toplam_aktifler', {})
+
+    # dates: gerçek bankalarda dolu görülen tüm tarihlerin birleşimi (artan)
+    date_set = set()
+    for bydict in bank_data.values():
+        for bname, series in bydict.items():
+            if bname in real_set:
+                for d, v in series.items():
+                    if v is not None:
+                        date_set.add(d)
+    dates = sorted(date_set)
+    meta['dates'] = dates
+    meta['total_periods'] = len(dates)
+
+    # default_date: dashboard açılışında seçili gelecek dönem. En güncel yüklenen
+    # dönem (dates[-1]) varsayılan yapılır; böylece admin panelinden yeni çeyrek
+    # yüklendiğinde kullanıcı doğrudan son dönemi görür.
+    odak = focus_of(catalog)
+    meta['focus_bank'] = odak
+    kt_dates = sorted(d for d, v in ta.get(odak, {}).items() if v is not None)
+    meta['default_date'] = dates[-1] if dates else (kt_dates[-1] if kt_dates else None)
+    # Reel TL / USD bazları için TÜFE ve kur katsayıları (pipeline/makro_seriler.json, 2026-10-02)
+    from pipeline.makro import donem_makro
+    meta['makro'] = donem_makro(dates)
+
+    # bank_coverage: her gerçek banka için toplam_aktifler dolu dönem sayısı
+    meta['bank_coverage'] = {
+        b: sum(1 for v in ta.get(b, {}).values() if v is not None)
+        for b in real_banks
+    }
+
+    # date_coverage: her tarihte kaç gerçek banka toplam_aktifler raporlamış.
+    # Yeni banka kuruldukça bu sayı zamanla artar (20→27, normal). Ama bir
+    # çeyrek admin panelden banka banka yüklenirken (bkz. default_date notu)
+    # geçici olarak SAYI GERİYE DÜŞER (ör. 26'dan 7'ye) — bu durumda pazar
+    # payı/Bps hesaplaması (frontend marketShare/msDeltaBps) o tarihi
+    # güvenilmez saymalı, aksi halde eksik bankalar paydan düşünce diğer
+    # herkesin payı yapay şekilde şişer (bkz. 2026-08-11 kullanıcı raporu:
+    # "pazar payı değişimlerinde bozulmalar vardı").
+    meta['date_coverage'] = {
+        d: sum(1 for b in real_banks if ta.get(b, {}).get(d) is not None)
+        for d in dates
+    }
+
+    # top20_by_date: her tarih için Toplam Aktifler'e göre ilk 20 banka
+    top20 = {}
+    for d in dates:
+        rows = [(b, ta.get(b, {}).get(d)) for b in real_banks
+                if ta.get(b, {}).get(d) is not None]
+        rows.sort(key=lambda x: x[1], reverse=True)
+        top20[d] = [b for b, _ in rows[:20]]
+    meta['top20_by_date'] = top20
+    from pipeline.groups import export_grup_adlari
+    meta['export_groups'] = export_grup_adlari(catalog)   # Excel dışa aktarım ek grupları (group_data'da)
+
+    # available_measures: en az bir gerçek bankada dolu değeri olan measure'lar
+    avail = []
+    for c in catalog.get('measures', []):
+        mid = c['id']
+        bydict = bank_data.get(mid, {})
+        if any(v is not None for b in real_banks for v in bydict.get(b, {}).values()):
+            avail.append(mid)
+    meta['available_measures'] = avail
+
+    # 2026-11-02: groups, banks ve timestamp senkronizasyonu
+    if catalog.get('groups'):
+        meta['groups'] = catalog['groups'].get('members', {})
+        meta['group_order'] = catalog['groups'].get('order', [])
+        meta['group_colors'] = catalog['groups'].get('colors', {})
+    if catalog.get('banks'):
+        meta['banks'] = catalog['banks']
+    meta['timestamp'] = meta.get('timestamp') or datetime.now().isoformat()
+
+    return meta
+
+
+# Grup (Kuveyt Türk, Mevduat Bankaları, Rakip Bankalar, Katılım Bankaları,
+# KT Hariç Katılım Bankaları) aggregate hesaplama TEK yerde yaşıyor:
+# pipeline.groups.build_group_data(). Daha önce burada ikinci, birebir aynı
+# işi yapan yerel bir kopya (`_build_group_data`) vardı — kaldırıldı, aşağıda
+# `from pipeline import build_group_data` ile aynı fonksiyon kullanılıyor.
+
+
+def _write_computed(payload: dict) -> None:
+    """computed.json'u atomik yaz (önce .tmp, sonra yerine taşı)."""
+    tmp = DATA_COMPUTED.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+        f.flush()
+        os.fsync(f.fileno())   # atomik yazımda kalıcılık: tmp → fsync → replace
+    tmp.replace(DATA_COMPUTED)
+
+
+def _run_pipeline_and_save(catalog: dict, *, force: bool, passthrough_only: bool) -> dict:
+    """
+    Parquet'ten tam hesaplama → güvenlik kilitleri → computed.json (atomik).
+
+    Yükleme, ZIP yükleme ve rebuild uçlarının ORTAK yolu (2026-09-29). Bu
+    dizi eskiden üç uçta ayrı ayrı kopyalanmıştı ve kopyalar ayrışmıştı:
+    ZIP yükleme compute_all'a banka listesini vermiyordu (Faz 4 düzeltmesi
+    oraya taşınmamıştı) — computed.json olmayan yeni bir sunucuda ZIP ile
+    ilk kurulum "Hesaplama boş sonuç verdi" hatasıyla duruyordu.
+
+    passthrough_only:
+      False → mevcut bank_data'nın tamamı taban alınır (yükleme / ZIP:
+              ham verisi olmayan eski dönemler korunur).
+      True  → yalnız BASELINE_PASSTHROUGH ölçüleri taşınır (rebuild: her
+              şey ham veriden baştan hesaplanır; bkz. admin_rebuild notu).
+    Dönüş: {'bank_data', 'regresyon', 'timestamp'}.
+    """
+    from pipeline import LookupContext, compute_all, build_group_data
+    from pipeline.composition import build_composition_payload
+    from pipeline.measures import BASELINE_PASSTHROUGH
+
+    bank_turu_map = {b['banka_adi']: b['tur'] for b in catalog['banks']}
+    all_bank_names = [b['banka_adi'] for b in catalog['banks']]
+
+    old = {}
+    if DATA_COMPUTED.exists():
+        with open(DATA_COMPUTED, encoding='utf-8') as f:
+            old = json.load(f)
+    base_data = old.get('bank_data', {})
+    if passthrough_only:
+        base_data = {mid: ser for mid, ser in base_data.items() if mid in BASELINE_PASSTHROUGH}
+
+    ctx = LookupContext.from_parquet(DATA_PARQUET, bank_turu_map)
+    # banks AÇIKÇA verilir (Faz 4): base_data boş/eksikken banks=None banka
+    # listesini baseline'dan türetip boş sonuç üretiyordu.
+    new_bank_data = compute_all(ctx, base_data, catalog, banks=all_bank_names, verbose=False)
+
+    # GÜVENLİK KİLİTLERİ: boş/şüpheli sonuç veya veri kaybı → yazma, mevcut veriyi koru
+    _assert_nonempty_result(new_bank_data)
+    regresyon = _assert_no_regression(new_bank_data, force=force)
+
+    meta = _rebuild_dynamic_meta(old.get('meta', {}), new_bank_data, catalog)
+    group_data = build_group_data(new_bank_data, catalog, ctx)
+    try:    # boş hücre nedenleri ("Tanımsız" / "Veri yok" etiketleri); başarısız olursa ana akış etkilenmez
+        from pipeline.bos_nedenleri import uret as _bos_uret
+        _bos = _bos_uret(ctx, catalog, new_bank_data)
+        DATA_BOS_NEDEN.write_text(json.dumps(_bos, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+    except Exception as e:   # noqa: BLE001
+        print(f'[uyarı] bos_nedenleri.json üretilemedi: {e}')
+    composition_data, currency_data = build_composition_payload(ctx, catalog)
+
+    timestamp = datetime.now().isoformat()
+    meta['timestamp'] = timestamp
+    _write_computed({
+        'meta': meta,
+        'catalog': catalog['measures'],
+        'bank_data': new_bank_data,
+        'group_data': group_data,
+        'composition_data': composition_data,
+        'currency_data': currency_data,
+        'timestamp': timestamp,
+    })
+    return {'bank_data': new_bank_data, 'regresyon': regresyon, 'timestamp': timestamp}
+
+# ============================================================
+# Admin: upload endpoint
+# ============================================================
+@app.post('/admin/upload')
+def admin_upload(
+    files: List[UploadFile] = File(...),
+    force: bool = Form(False),   # regresyon kilidini atla (2026-09-08)
+    user: str = Depends(heavy_op_guard),
+):
+    """
+    Bir veya birden fazla xlsx yükle, pipeline'ı BİR KEZ çalıştır, computed.json'u güncelle.
+
+    NOT (2026-08-09 düzeltmesi): Bu endpoint önceden `file: UploadFile` (tekil)
+    bekliyordu ama admin.html'deki frontend her zaman çoklu-dosya alanı olarak
+    `files` (çoğul) gönderiyordu — FastAPI eşleşmeyen alan adını `file` olarak
+    zorunlu kabul ettiğinden HER upload denemesi `422 Field required` ile
+    başarısız oluyordu. Ayrıca eskiden N dosya, N kere tam pipeline çalıştırırdı
+    (her biri data/raw/'daki TÜM dosyaları yeniden tarardı) — 27 dosyalık bir
+    çeyrek yüklemesi ~40 dakika sürerdi. Artık: dosyalar önce hepsi kaydedilir,
+    pipeline (parquet güncelleme + compute_all + group + composition) TEK sefer
+    çalışır.
+
+    NOT (2026-08-11 düzeltmesi): Parquet adımı artık INCREMENTAL —
+    data/raw/'daki TÜM dosyaları değil, SADECE bu istekte yüklenenleri parse
+    eder (bkz. pipeline.ingest.update_parquet_incremental). Önceden tek
+    dosyalık bir yükleme bile ~50 saniye sürerdi (%42'si — dokunulmamış
+    1170+ dosyayı yeniden okumaktan); artık o adım N dosyayla orantılı.
+    compute_all/build_group_data/composition adımları GÜVENLİK GEREĞİ hâlâ
+    TÜM bankalar için tam yeniden hesaplanıyor (grup agregasyonları/pazar
+    payı tüm bankaların güncel değerine muhtaç — kısmi hesaplama yanlış
+    sonuç riski taşırdı, bkz. 2026-08-11'de bulunan grup/pazar payı bug'ları).
+
+    Adımlar:
+    1. Her dosya için ad doğrulama (banka + çeyrek-sonu tarih formatı)
+    2. İçerik kalite kontrolü (2026-08-11 eklendi) — bkz.
+       pipeline.ingest.check_data_quality: Bloomberg/FactSet eklentisi
+       olmadan export edilmiş (Tutar hücreleri '#VALUE!'/boş) dosyalar
+       reddedilir, aksi halde ölçütler sessizce 0'a düşerdi.
+    3. Geçerli olanlar data/raw/<Banka>/<Banka> - DD.MM.YYYY.xlsx olarak kaydedilir
+    4. Parquet incremental güncelleme (SADECE yüklenen dosyalar — bkz. yukarı)
+    5. compute_all → data/computed.json (TEK yazma)
+    6. Upload geçmişine, her dosya için ayrı kayıt
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail='Dosya gönderilmedi')
+
+    _backup_computed()  # yeni veri yazılmadan mevcut computed.json'u yedekle (denetim #10)
+
+    # Lazy import — pipeline modülleri ağır
+    from pipeline.ingest import (
+        parse_filename, validate_filename, check_data_quality,
+        update_parquet_incremental,
+    )
+
+    # Catalog yükle
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=500, detail='catalog.json yok')
+    with open(DATA_CATALOG, encoding='utf-8') as f:
+        catalog = json.load(f)
+
+    valid_banks = [b['banka_adi'] for b in catalog['banks']
+                   if b['tur'] != 'Grup']
+    bank_turu_map = {b['banka_adi']: b['tur'] for b in catalog['banks']}
+
+    # 1. Her dosyayı doğrula + data/raw/'a kaydet. Geçersiz dosyalar
+    # ATLANIR (tek dosyanın adı yanlışsa tüm batch iptal olmasın), rapora
+    # 'skipped' olarak düşer. Kaydedilenler hata durumunda geri alınabilsin
+    # diye ayrı listelenir.
+    saved: list[dict] = []
+    skipped: list[dict] = []
+    for file in files:
+        if not file.filename.lower().endswith('.xlsx'):
+            skipped.append({'filename': file.filename, 'sebep': 'Sadece .xlsx kabul edilir'})
+            file.file.close()
+            continue
+        ok, err = validate_filename(file.filename, valid_banks)
+        if not ok:
+            skipped.append({'filename': file.filename, 'sebep': err})
+            file.file.close()
+            continue
+
+        # İçeriği belleğe oku — hem kalite kontrolü hem diske yazma bunun
+        # üzerinden yapılır (stream'i iki kere tüketmemek için).
+        try:
+            content = _sinirli_oku(file.file, MAX_XLSX_BYTES, file.filename)
+        except HTTPException as e:
+            skipped.append({'filename': file.filename, 'sebep': e.detail})
+            continue
+        finally:
+            file.file.close()
+
+        # İçerik kalite kontrolü (2026-08-11 eklendi): Bloomberg/FactSet
+        # eklentisi olmadan export edilen dosyalarda Tutar hücreleri
+        # '#VALUE!' veya boş kalır. Bu fark edilmeden kabul edilirse
+        # LookupContext._lookup() eksik veriyi sessizce 0.0'a çevirir —
+        # ölçütler yanlışlıkla "gerçek sıfır" gibi görünür, hiçbir hata
+        # vermeden (bkz. pipeline/ingest.py::check_data_quality docstring).
+        ok, err = check_data_quality(io.BytesIO(content))
+        if not ok:
+            skipped.append({'filename': file.filename, 'sebep': f'Veri kalitesi: {err}'})
+            continue
+
+        banka, tarih = parse_filename(file.filename)
+        bank_dir = DATA_RAW / banka
+        bank_dir.mkdir(parents=True, exist_ok=True)
+        target = bank_dir / file.filename
+
+        # Üzerine yazma durumunda ÖNCEKİ içeriği belleğe al — pipeline bu
+        # istekte başarısız olursa geri yüklenecek. (2026-08-09 bug: eskiden
+        # hata durumunda dosya doğrudan silinirdi; bu, aynı ada sahip VAR
+        # OLAN bir dosyayı — örn. çeyrek dosyası yanlışlıkla tekrar
+        # yüklendiğinde — kalıcı olarak kaybettiriyordu.)
+        onceki_icerik = target.read_bytes() if target.exists() else None
+
+        target.write_bytes(content)
+        saved.append({
+            'filename': file.filename, 'banka': banka, 'tarih': tarih,
+            'target': target, 'file_size': target.stat().st_size,
+            'onceki_icerik': onceki_icerik,
+        })
+
+    if not saved:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Geçerli dosya yok. Atlananlar: {skipped}',
+        )
+
+    # Pipeline çalıştır — TÜM dosyalar için TEK sefer
+    try:
+        # 2. Parquet güncelleme — INCREMENTAL (2026-08-11): data/raw/'daki
+        # TÜM 1176 dosyayı değil, SADECE bu istekte yüklenen dosyaları
+        # parse eder. Önceden burada rebuild_parquet (tam tarama) vardı —
+        # tek dosyalık bir yüklemede bile ~50 saniyenin ~22 saniyesi
+        # (rebuild_parquet adımı) sırf dokunulmamış 1170+ dosyayı yeniden
+        # okumaya gidiyordu (bkz. verimlilik raporu, madde 2).
+        update_parquet_incremental(
+            [(s['target'], s['banka'], s['tarih'], bank_turu_map.get(s['banka']))
+             for s in saved],
+            DATA_PARQUET,
+        )
+
+        # 3-5. Tam hesaplama + güvenlik kilitleri + atomik yazma (mevcut
+        # computed.json taban alınır — bkz. _run_pipeline_and_save)
+        sonuc = _run_pipeline_and_save(catalog, force=force, passthrough_only=False)
+        new_bank_data, regresyon, timestamp = sonuc['bank_data'], sonuc['regresyon'], sonuc['timestamp']
+
+        # 6. Geçmişe kayıt — her dosya için ayrı satır (denetim izi)
+        for s in saved:
+            _append_history({
+                'timestamp': timestamp,
+                'user': user,
+                'filename': s['filename'],
+                'banka': s['banka'],
+                'tarih': s['tarih'],
+                'file_size': s['file_size'],
+                'status': 'ok',
+            })
+
+        # 7. Spot check — yüklenen ilk dosyanın banka × tarihi için
+        ilk = saved[0]
+        spot_check = {}
+        for mid in ['toplam_aktifler', 'krediler', 'mevduat',
+                    'ozkaynaklar', 'net_donem_kari']:
+            spot_check[mid] = new_bank_data.get(mid, {}).get(ilk['banka'], {}).get(ilk['tarih'])
+
+        return JSONResponse({
+            'status': 'ok',
+            'files_processed': len(saved),
+            'files_skipped': skipped,
+            'banks_affected': sorted({s['banka'] for s in saved}),
+            'measures_computed': len(new_bank_data),
+            'regression_check': regresyon,
+            'banks_in_pipeline': len({b for m in new_bank_data.values()
+                                       for b in m.keys()}),
+            'timestamp': timestamp,
+            'spot_check': spot_check,
+        })
+
+    except Exception as exc:
+        # Hata: BU istekte yazılan dosyaları geri al.
+        # - Dosya YENİ eklenmişse (öncesinde yoktu) → sil.
+        # - Dosya VAR OLAN birinin üzerine yazılmışsa → eski içeriğini geri
+        #   yükle, SİLME (aksi halde bu istekten önce var olan gerçek veri
+        #   kaybolur — bkz. yukarıdaki 'onceki_icerik' yorumu).
+        for s in saved:
+            try:
+                if s['onceki_icerik'] is not None:
+                    s['target'].write_bytes(s['onceki_icerik'])
+                else:
+                    s['target'].unlink()
+            except FileNotFoundError:
+                pass
+            _append_history({
+                'timestamp': datetime.now().isoformat(),
+                'user': user,
+                'filename': s['filename'],
+                'banka': s['banka'],
+                'tarih': s['tarih'],
+                'file_size': s['file_size'],
+                'status': 'error',
+                'error': f'{type(exc).__name__}: {exc}',
+            })
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f'Pipeline hatası: {type(exc).__name__}: {exc}',
+        )
+
+
+# ============================================================
+# Admin: BDR-Kısayol JSON test yükleme — Faz 1, destekleyici/test (2026-09-12)
+# ============================================================
+@app.post('/admin/cikti-test-upload')
+def admin_cikti_test_upload(
+    file: UploadFile = File(...),
+    user: str = Depends(heavy_op_guard),
+):
+    """
+    BDR-Kısayol'un `<DÖNEM>.json` çıktısını (bkz. VERI-FORMATI.md) test amaçlı
+    işler ve mevcut computed.json ile KALEM SEVİYESİNDE karşılaştırır.
+
+    FAZ 1 — DESTEKLEYİCİ/TEST: Bu endpoint `data/computed.json`,
+    `data/veriler.parquet` veya `data/raw/`'a HİÇBİR ŞEKİLDE yazmaz. JSON,
+    pipeline.cikti_ingest ile bellek-içi bir long-format DataFrame'e
+    çevrilir, pipeline.cikti_diagnostics.diagnose() ile (pipeline.measures
+    DEĞİŞTİRİLMEDEN) her (ölçü, banka, tarih) hücresi TEK TEK hesaplanır —
+    her hücrenin hangi ham kalem lookup'larını (ctx.bilanco/gelir/mvy/...)
+    tetiklediği de izlenir. Sonuç mevcut computed.json'daki gerçek
+    değerlerle karşılaştırılır ve İKİ seviyede rapor üretilir:
+    (1) hücre bazlı — hangi ölçü/banka/tarih farklı, hangi ham kalem
+        lookup'ı o hücrede eksikti;
+    (2) kalem bazlı (agregat) — tüm çalışma boyunca hangi ham kalem hiç/
+        kısmen bulunamadı, kaç ölçüyü etkiliyor — bu, `pipeline/
+        cikti_ingest.py`'de tam olarak NEREDE eşleme eksikliği olduğunu
+        doğrudan gösterir.
+    """
+    if not file.filename.lower().endswith('.json'):
+        raise HTTPException(status_code=400, detail='Sadece .json kabul edilir')
+
+    try:
+        content = _sinirli_oku(file.file, MAX_JSON_UPLOAD_BYTES, 'JSON dosyası')
+    finally:
+        file.file.close()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f'Geçersiz JSON: {exc}')
+
+    if 'kayitlar' not in data or 'donem' not in data:
+        raise HTTPException(status_code=400, detail="JSON'da 'donem'/'kayitlar' anahtarları yok")
+
+    from pipeline.cikti_ingest import cikti_to_dataframe, bankalar_ve_donemler
+    from pipeline.cikti_diagnostics import diagnose
+
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=500, detail='catalog.json yok')
+    with open(DATA_CATALOG, encoding='utf-8') as f:
+        catalog = json.load(f)
+
+    try:
+        df, banka_turu_map = cikti_to_dataframe(data)
+        banks, dates = bankalar_ve_donemler(data)
+        if df.empty or not banks or not dates:
+            raise HTTPException(status_code=400, detail='JSON boş veya tanınmayan formatta')
+
+        if not DATA_COMPUTED.exists():
+            raise HTTPException(status_code=500, detail='computed.json yok')
+        with open(DATA_COMPUTED, encoding='utf-8') as f:
+            base_bank_data = json.load(f)['bank_data']
+
+        rapor = diagnose(df, banka_turu_map, catalog['measures'], banks, dates, base_bank_data)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f'Dönüştürme/karşılaştırma hatası: {type(exc).__name__}: {exc}')
+
+    return JSONResponse({
+        'status': 'ok',
+        'donem': data.get('donem'),
+        'banka_sayisi': len(banks),
+        'satir_sayisi': int(len(df)),
+        'ozet': rapor['ozet'],
+        'satirlar': rapor['satirlar'],
+        'kalem_kapsama': rapor['kalem_kapsama'],
+        'not': 'Faz 1 — destekleyici/test: computed.json/veriler.parquet/data/raw hiçbir şekilde değiştirilmedi.',
+    })
+
+
+# ============================================================
+# Admin: ZIP upload — bulk replace raw + auto rebuild (Faz 3.6)
+# ============================================================
+@app.post('/admin/upload-zip')
+def admin_upload_zip(
+    file: UploadFile = File(...),
+    force: bool = Form(False),   # regresyon kilidini atla (2026-09-08)
+    user: str = Depends(heavy_op_guard),
+):
+    """
+    ZIP yükle, içindeki tüm xlsx'leri data/raw/'a yerleştir, pipeline çalıştır.
+
+    KULLANIM SENARYOSU:
+    - Bloomberg/FactSet eklentisi olmadan extract edilince #NAME? alan xlsx'ler
+    - ZIP'in içindeki cached değerler bozulmadan korunur
+    - Tarayıcının/işletim sisteminin Türkçe karakter sorunlarını bypass eder
+
+    BEKLENEN ZIP YAPISI (esnek):
+        Veriler/Akbank/Akbank - 30.06.2014.xlsx          ← üstte 'Veriler/' wrapper varsa otomatik atlanır
+        Veriler/Kuveyt Türk/Kuveyt Türk - 30.09.2025.xlsx
+        ...
+    veya doğrudan banka klasörleri:
+        Akbank/Akbank - 30.06.2014.xlsx
+        Kuveyt Türk/Kuveyt Türk - 30.09.2025.xlsx
+
+    Süre: 5-15 dakika (ZIP'e bağlı). Tarayıcı sekmesini kapatma.
+    """
+    import zipfile
+    import io
+    import tempfile
+
+    started = datetime.now().isoformat()
+
+    if not file.filename.lower().endswith('.zip'):
+        raise HTTPException(status_code=400, detail='Sadece .zip kabul edilir')
+
+    _backup_computed()  # yeni veri yazılmadan mevcut computed.json'u yedekle (denetim #10)
+
+    # Catalog yükle
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=500, detail='catalog.json yok')
+    with open(DATA_CATALOG, encoding='utf-8') as f:
+        catalog = json.load(f)
+    bank_turu_map = {b['banka_adi']: b['tur'] for b in catalog['banks']}
+    valid_banks = set(b['banka_adi'] for b in catalog['banks']
+                       if b['tur'] != 'Grup')
+
+    # ZIP'i geçici dosyaya yaz (büyük ZIP'leri belleğe yüklemek riskli)
+    with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmpf:
+        tmp_zip_path = Path(tmpf.name)
+        try:
+            yazilan = 0
+            while True:
+                parca = file.file.read(1024 * 1024)
+                if not parca:
+                    break
+                yazilan += len(parca)
+                if yazilan > MAX_ZIP_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail='ZIP çok büyük (en fazla %d MB)' % (MAX_ZIP_UPLOAD_BYTES // (1024 * 1024)))
+                tmpf.write(parca)
+        except HTTPException:
+            tmpf.close()
+            tmp_zip_path.unlink(missing_ok=True)
+            raise
+        finally:
+            file.file.close()
+
+    zip_size = tmp_zip_path.stat().st_size
+
+    def _safe_filename(info: zipfile.ZipInfo) -> str:
+        """
+        ZIP entry filename'ini UTF-8 olarak döndür.
+
+        ZIP encoding hakikatleri:
+        - Standartta filename CP437 olmalı, UTF-8 ise flag_bits bit 11 set
+        - Pratikte: Windows ZIP araçları bu flag'i unutur veya mojibake yapar
+        - 'Kuveyt Türk' → 'Kuveyt T├╝rk' gibi karakterler ortaya çıkar
+
+        Strateji: cp437 → utf-8 round-trip dene. Başarılı olursa ve sonuç
+        ASCII olmayan Türkçe karakter içeriyorsa onu kullan (orijinal
+        muhtemelen mojibake idi). Aksi takdirde orijinali döndür.
+        """
+        original = info.filename
+        try:
+            # Orijinal string'i cp437 olarak yorumla (her byte 1:1 eşlenir),
+            # sonra UTF-8 olarak decode et
+            candidate = original.encode('cp437').decode('utf-8')
+            # Eğer candidate non-ASCII Türkçe karakter içeriyorsa → mojibake çözüldü
+            # (Türkçe karakterler: ş, ç, ğ, ı, ö, ü, İ, Ş, Ç, Ğ, Ö, Ü)
+            tr_chars = set('şçğıöüŞÇĞİÖÜâêîôûÂÊÎÔÛ')
+            if any(ch in tr_chars for ch in candidate):
+                return candidate
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        return original
+
+    raw_yedek = None        # eski banka klasörlerinin taşındığı yedek (adım 2)
+    dosya_yedekleri = []    # [(asıl, yedek)]: pipeline'ın yeniden yazacağı parquet / bos_nedenleri
+    cikarilan = set()       # ZIP'ten data/raw'a YENİ yazılan banka klasörleri (geri alırken yalnız bunlar silinir)
+
+    def _geri_al():
+        """Hata sonrası data/raw, parquet ve bos_nedenleri.json'u işlem öncesi hâline döndürür.
+        Yalnız bu işlemin yazdığı klasörler silinir: taşıma yarıda kalmışsa henüz taşınmamış orijinaller yerinde kalır.
+        Geri alınamayan bir şey olursa yedek yolu loga yazılır ve yedek SİLİNMEZ. Dönüş: sorun listesi."""
+        sorunlar = []
+        for ad in cikarilan:
+            shutil.rmtree(DATA_RAW / ad, ignore_errors=True)
+        if raw_yedek is not None and raw_yedek.exists():
+            for d in list(raw_yedek.iterdir()):
+                hedef = DATA_RAW / d.name
+                if hedef.exists():
+                    sorunlar.append(f'{hedef} zaten var, yedekten dönülemedi ({d})')
+                    continue
+                try:
+                    shutil.move(str(d), str(hedef))
+                except OSError as e:
+                    sorunlar.append(f'{d} geri taşınamadı: {e}')
+            if not sorunlar:
+                try:
+                    raw_yedek.rmdir()
+                except OSError as e:
+                    sorunlar.append(f'{raw_yedek} silinemedi: {e}')
+        for asil, yedek in dosya_yedekleri:
+            try:
+                gecici = asil.with_name(asil.name + '.geri_tmp')
+                shutil.copy2(yedek, gecici)
+                gecici.replace(asil)
+            except OSError as e:
+                sorunlar.append(f'{asil} yedekten ({yedek}) dönülemedi: {e}')
+        if sorunlar:
+            print('[upload-zip] GERİ ALMA SORUNLARI (yedekler data/backups altında duruyor): ' + '; '.join(sorunlar))
+        elif raw_yedek is not None or dosya_yedekleri or cikarilan:
+            print(f"[upload-zip] hata: data/raw ve pipeline dosyaları işlem öncesine döndürüldü ({raw_yedek})")
+        return sorunlar
+
+    def _eski_raw_yedeklerini_temizle(keep=1):
+        for eski in sorted(DATA_BACKUPS.glob('raw_*'))[:-keep]:
+            shutil.rmtree(eski, ignore_errors=True)
+        for asil, _y in dosya_yedekleri:   # parquet/bos_nedenleri: yalnız son yedek
+            for eski in sorted(DATA_BACKUPS.glob(f'{asil.stem}_*{asil.suffix}'))[:-keep]:
+                eski.unlink(missing_ok=True)
+
+    try:
+        # 1. ZIP'i validate et — banka klasörü yapısı doğru mu?
+        with zipfile.ZipFile(tmp_zip_path, 'r') as zf:
+            zip_sorun = security.zip_guvenli(zf, MAX_ZIP_ENTRY_BYTES, MAX_ZIP_TOTAL_BYTES)
+            if zip_sorun:
+                raise HTTPException(status_code=400, detail=zip_sorun)
+            xlsx_entries = [
+                info for info in zf.infolist()
+                if not info.is_dir()
+                and _safe_filename(info).lower().endswith('.xlsx')
+            ]
+            if not xlsx_entries:
+                raise HTTPException(
+                    status_code=400,
+                    detail='ZIP içinde .xlsx dosyası yok'
+                )
+
+            # Banka klasör adlarını çıkar (UTF-8 safe)
+            banks_in_zip = set()
+            for info in xlsx_entries:
+                fname = _safe_filename(info)
+                parts = fname.replace('\\', '/').split('/')
+                if len(parts) >= 2:
+                    banka = parts[-2]
+                    banks_in_zip.add(kanonik_banka(banka))
+
+            unknown_banks = banks_in_zip - valid_banks
+            if unknown_banks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f'Catalog\'ta tanımlı olmayan banka(lar): '
+                           f'{sorted(unknown_banks)}. ZIP yapısı: '
+                           f'<banka_klasoru>/<banka> - DD.MM.YYYY.xlsx'
+                )
+
+            # 2. data/raw/ altındaki mevcut banka klasörlerini sil
+            # Silmek yerine yedek klasöre TAŞI (aynı disk: anlık). Çıkarma ya da
+            # pipeline hata verirse aşağıdaki except dalları geri yükler.
+            existing_dirs = [d for d in DATA_RAW.iterdir()
+                              if d.is_dir() and not d.name.startswith('.')]
+            if existing_dirs:
+                raw_yedek = DATA_BACKUPS / f"raw_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                raw_yedek.mkdir(parents=True, exist_ok=True)
+                for d in existing_dirs:
+                    shutil.move(str(d), str(raw_yedek / d.name))
+            print(f"[upload-zip] {len(existing_dirs)} eski banka klasörü yedeğe taşındı: {raw_yedek}")
+
+            # 3. ZIP içindeki dosyaları locale-safe şekilde extract et
+            n_extracted = 0
+            for info in xlsx_entries:
+                fname = _safe_filename(info)
+                parts = fname.replace('\\', '/').split('/')
+                if len(parts) < 2:
+                    continue
+                banka = kanonik_banka(parts[-2])   # 'QNB Finansbank/' klasörü → data/raw/QNB/
+                file_name = parts[-1]
+
+                target_dir = DATA_RAW / banka
+                cikarilan.add(banka)   # geri almada yalnız bu işlemin yazdığı klasörler silinir
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = target_dir / file_name
+
+                with zf.open(info) as src, open(target_path, 'wb') as out:
+                    shutil.copyfileobj(src, out)   # tüm dosyayı belleğe okumadan
+                n_extracted += 1
+
+            print(f"[upload-zip] {n_extracted} xlsx data/raw/'a yerleştirildi")
+
+        # 4. Pipeline çalıştır. Önce, pipeline'ın üzerine yazacağı parquet ve bos_nedenleri.json yedeklenir
+        # (computed.json'u _run_pipeline_and_save/_backup_computed zaten korur); hata dalı bunları da geri alır.
+        zip_ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        DATA_BACKUPS.mkdir(parents=True, exist_ok=True)
+        for asil in (DATA_PARQUET, DATA_BOS_NEDEN):
+            if asil.exists():
+                yedek = DATA_BACKUPS / f'{asil.stem}_{zip_ts}{asil.suffix}'
+                shutil.copy2(asil, yedek)
+                dosya_yedekleri.append((asil, yedek))
+        from pipeline.ingest import rebuild_parquet
+        rebuild_parquet(DATA_RAW, DATA_PARQUET, bank_turu_map)
+
+        # 5-6. Tam hesaplama + güvenlik kilitleri + atomik yazma (mevcut
+        # computed.json taban alınır — bkz. _run_pipeline_and_save)
+        sonuc = _run_pipeline_and_save(catalog, force=force, passthrough_only=False)
+        new_bank_data, regresyon, timestamp = sonuc['bank_data'], sonuc['regresyon'], sonuc['timestamp']
+        _eski_raw_yedeklerini_temizle()   # başarı: yalnız en son raw yedeği kalır
+
+        # 7. History
+        _append_history({
+            'timestamp': timestamp,
+            'user': user,
+            'filename': f'[ZIP-UPLOAD] {file.filename}',
+            'banka': '*ALL*',
+            'tarih': '*ALL*',
+            'file_size': zip_size,
+            'status': 'ok',
+            'rebuild': True,
+            'banks_in_zip': len(banks_in_zip),
+            'files_extracted': n_extracted,
+        })
+
+        # 8. Spot check
+        spot_check = {}
+        ta = new_bank_data.get('toplam_aktifler', {}).get('Kuveyt Türk', {})
+        if ta:
+            # Sadece sayısal değer olan en son dönem
+            valid_quarters = [q for q, v in ta.items() if v is not None]
+            if valid_quarters:
+                latest_q = max(valid_quarters)
+                for mid in ['toplam_aktifler', 'krediler', 'mevduat',
+                            'ozkaynaklar', 'net_donem_kari']:
+                    v = new_bank_data.get(mid, {}).get('Kuveyt Türk', {}).get(latest_q)
+                    spot_check[mid] = v
+                spot_check['_quarter'] = latest_q
+
+        return JSONResponse({
+            'status': 'ok',
+            'banks_processed': len(banks_in_zip),
+            'files_processed': n_extracted,
+            'measures_computed': len(new_bank_data),
+            'regression_check': regresyon,
+            'banks_in_pipeline': len({b for m in new_bank_data.values()
+                                       for b in m.keys()}),
+            'zip_size': zip_size,
+            'started': started,
+            'completed': timestamp,
+            'spot_check': spot_check,
+        })
+
+    except HTTPException:
+        try:
+            _geri_al()
+        except Exception:
+            traceback.print_exc()   # geri alma hatası özgün 400/409 yanıtını gizlemesin
+        raise
+    except Exception as exc:
+        try:
+            _geri_al()
+        except Exception:
+            traceback.print_exc()
+        _append_history({
+            'timestamp': datetime.now().isoformat(),
+            'user': user,
+            'filename': f'[ZIP-UPLOAD-FAILED] {file.filename}',
+            'banka': '*ALL*',
+            'tarih': '*ALL*',
+            'file_size': zip_size,
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+            'rebuild': True,
+        })
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f'ZIP upload hatası: {type(exc).__name__}: {exc}',
+        )
+    finally:
+        # Geçici ZIP'i temizle
+        try:
+            tmp_zip_path.unlink()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Admin: rebuild — tüm raw'dan baştan hesapla (Faz 3.5)
+# ============================================================
+@app.post('/admin/rebuild')
+def admin_rebuild(force: bool = False,   # ?force=true ile regresyon kilidini atla (2026-09-08)
+                  user: str = Depends(heavy_op_guard)):
+    """
+    data/raw/ altındaki tüm xlsx'leri tarayıp parquet'i baştan üret,
+    compute_all ile tüm computed.json'u yeniden hesapla.
+
+    KULLANIM SENARYOSU:
+    - Pipeline'da bug fix yapıldı, tüm geçmişi yeniden hesaplamak gerekiyor
+    - İlk seferinde tüm raw veriyi cloud'a yükledikten sonra hepsini işle
+
+    Süre: 27 banka × ~48 çeyrek × 128 measure → ~5-10 dakika
+    """
+    started = datetime.now().isoformat()
+
+    _backup_computed()  # yeni veri yazılmadan mevcut computed.json'u yedekle (denetim #10)
+
+    # Catalog yükle
+    if not DATA_CATALOG.exists():
+        raise HTTPException(status_code=500, detail='catalog.json yok')
+    with open(DATA_CATALOG, encoding='utf-8') as f:
+        catalog = json.load(f)
+    bank_turu_map = {b['banka_adi']: b['tur'] for b in catalog['banks']}
+
+    # Raw klasörünü kontrol et
+    if not DATA_RAW.exists() or not any(DATA_RAW.iterdir()):
+        raise HTTPException(
+            status_code=400,
+            detail=f'data/raw boş. Önce raw xlsx dosyalarını yükleyin.'
+        )
+
+    bank_dirs = [d for d in DATA_RAW.iterdir()
+                  if d.is_dir() and not d.name.startswith('.')]
+
+    if not bank_dirs:
+        raise HTTPException(
+            status_code=400,
+            detail='data/raw altında banka klasörü yok'
+        )
+
+    n_files_total = sum(len(list(d.glob('*.xlsx'))) for d in bank_dirs)
+
+    try:
+        # 1. Tüm raw'dan parquet rebuild
+        from pipeline.ingest import rebuild_parquet
+        rebuild_parquet(DATA_RAW, DATA_PARQUET, bank_turu_map)
+
+        # 2. compute_all — MEASURE_FUNCS'takiler HER ZAMAN taze ham veriden
+        # hesaplanır (base_data'da ne olursa olsun override edilir). Ama
+        # BASELINE_PASSTHROUGH'taki measure'lar (SYR, RORWA, NIM, Spread gibi
+        # ham BDDK ana raporunda hiç bulunmayan ~13 kalem) raw'dan ASLA
+        # hesaplanamaz — compute_all bunları base_data'dan olduğu gibi
+        # kopyalar. base_data={} verilirse bu kalemler yeni bank_data'da HİÇ
+        # OLUŞMAZ (bug: 2026-08-09'da SYR dahil 13 measure tüm rebuild'lerde
+        # sessizce kayboluyordu). Düzeltme: mevcut computed.json'daki
+        # passthrough değerlerini oku, base_data olarak ver — böylece her
+        # rebuild bir öncekinin passthrough verisini taşır (self-sustaining).
+        # Hesaplama + güvenlik kilitleri + atomik yazma: _run_pipeline_and_save
+        # (passthrough_only=True → yalnız passthrough ölçüleri taşınır).
+        sonuc = _run_pipeline_and_save(catalog, force=force, passthrough_only=True)
+        new_bank_data, regresyon, timestamp = sonuc['bank_data'], sonuc['regresyon'], sonuc['timestamp']
+
+        # 4. History'e özel rebuild kaydı düş
+        _append_history({
+            'timestamp': timestamp,
+            'user': user,
+            'filename': f'[REBUILD] {len(bank_dirs)} banka, {n_files_total} dosya',
+            'banka': '*ALL*',
+            'tarih': '*ALL*',
+            'file_size': 0,
+            'status': 'ok',
+            'rebuild': True,
+        })
+
+        # 5. Spot check — KT için son çeyrek (varsa)
+        spot_check = {}
+        # En son çeyreği bul
+        ta = new_bank_data.get('toplam_aktifler', {}).get('Kuveyt Türk', {})
+        if ta:
+            latest_q = max(ta.keys())
+            for mid in ['toplam_aktifler', 'krediler', 'mevduat',
+                        'ozkaynaklar', 'net_donem_kari']:
+                v = new_bank_data.get(mid, {}).get('Kuveyt Türk', {}).get(latest_q)
+                spot_check[mid] = v
+
+        return JSONResponse({
+            'status': 'ok',
+            'banks_processed': len(bank_dirs),
+            'files_processed': n_files_total,
+            'measures_computed': len(new_bank_data),
+            'regression_check': regresyon,
+            'banks_in_pipeline': len({b for m in new_bank_data.values()
+                                       for b in m.keys()}),
+            'started': started,
+            'completed': timestamp,
+            'spot_check': spot_check,
+        })
+
+    except Exception as exc:
+        _append_history({
+            'timestamp': datetime.now().isoformat(),
+            'user': user,
+            'filename': f'[REBUILD-FAILED]',
+            'banka': '*ALL*',
+            'tarih': '*ALL*',
+            'file_size': 0,
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+            'rebuild': True,
+        })
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f'Rebuild hatası: {type(exc).__name__}: {exc}',
+        )
+
+
+# ============================================================
+# Veri Taşıma — Dışa Aktar / İçe Aktar (2026-08-25)
+# ============================================================
+# SSH/dosya sistemi erişimi olmayan bir sunucuya (ör. üçüncü bir hosting
+# sağlayıcısı üzerinde çalışan canlı) veriyi GÜVENİLİR ve DOĞRULANABİLİR
+# şekilde taşımak için: admin panelinden tek tıkla indirilen bir ZIP,
+# yine admin panelinden hedef sunucuya yüklenir. Elle "proje klasörünü
+# zip'le" yöntemi .gitignore'u atlar ve hangi anlık görüntünün taşındığını
+# belirsiz bırakır (2026-08-19'da yaşanan olay: bir sunucuda sadece
+# Eylül 2025 verisi çıktı, çünkü aktarılan data/ klasörü o tarihte donmuştu
+# ve bu hiçbir yerde kayıtlı değildi). Bu paket manifest.json ile "hangi
+# tarihte, hangi commit'ten, kaç banka/ölçü/dönem" sorusunu her zaman
+# yanıtlanabilir kılar.
+#
+# KAPSAM: computed.json + veriler.parquet + upload_history.json (+ opsiyonel
+# users.json). data/raw/ (ham xlsx arşivi, ~178MB, binlerce dosya) BU pakete
+# dahil DEĞİL — sadece dashboard'un çalışması için gerekli önceden-hesaplanmış
+# veriler taşınır. Tam geçmişten /admin/rebuild yapma kapasitesi gerekiyorsa
+# data/raw/ ayrıca (rsync ile, SSH erişimi olan bir ortamdan) taşınmalı.
+EXPORT_DATA_FILES = [
+    ('computed.json', DATA_COMPUTED),
+    ('veriler.parquet', DATA_PARQUET),
+    ('upload_history.json', DATA_HISTORY),
+    ('board.json', DATA_BOARD),
+]
+
+
+def _build_export_manifest() -> dict:
+    manifest: dict = {
+        'exported_at': datetime.now().isoformat(),
+        'git_commit': None,
+        'measure_count': None,
+        'bank_count': None,
+        'total_periods': None,
+        'date_range': None,
+    }
+    try:
+        r = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=APP_ROOT, capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            manifest['git_commit'] = r.stdout.strip()
+    except Exception:
+        pass
+    if DATA_COMPUTED.exists():
+        try:
+            with open(DATA_COMPUTED, encoding='utf-8') as f:
+                computed = json.load(f)
+            bank_data = computed.get('bank_data', {})
+            manifest['measure_count'] = len(bank_data)
+            ta = bank_data.get('toplam_aktifler', {})
+            manifest['bank_count'] = len(ta)
+            all_dates = sorted({
+                d for series in ta.values() for d, v in series.items()
+                if v is not None
+            })
+            manifest['total_periods'] = len(all_dates)
+            manifest['date_range'] = [all_dates[0], all_dates[-1]] if all_dates else None
+        except Exception:
+            pass
+    return manifest
+
+
+@app.get('/admin/backlog')
+def admin_backlog(_: str = Depends(require_admin_perm('admin_proje'))):
+    """
+    docs/PROJE_EL_KITABI.md'yi ham metin olarak döner — admin panelde
+    "Proje El Kitabı" sekmesi bunu markdown render edip gösterir. Dosya
+    git-tracked (koddan ayrı taşınan data/'nın aksine, deploy'da hep kod ile
+    birlikte gelir). 2026-09-08: kaynak BACKLOG.md'den el kitabına taşındı —
+    kronoloji, yol haritası, mimari ve işletme rehberi tek dosyada birleşti.
+    """
+    backlog_path = APP_ROOT / 'docs' / 'PROJE_EL_KITABI.md'
+    if not backlog_path.exists():
+        raise HTTPException(status_code=404, detail='docs/PROJE_EL_KITABI.md bulunamadı')
+    return Response(
+        content=backlog_path.read_text(encoding='utf-8'),
+        media_type='text/markdown; charset=utf-8',
+        headers=NO_CACHE,
+    )
+
+
+@app.get('/admin/export-data')
+def admin_export_data(
+    include_users: bool = False,
+    admin_user: str = Depends(require_admin_perm('admin_veri')),
+):
+    """
+    Canlı veriyi (computed.json + veriler.parquet + upload_history.json,
+    opsiyonel users.json) tek bir ZIP olarak indirir — bir sunucudan diğerine
+    SSH gerektirmeden, admin panelinden taşımak için. ZIP içindeki
+    manifest.json, dışa aktarma anını, kaynak git commit'ini ve veri
+    özetini (ölçü/banka/dönem sayısı, tarih aralığı) kaydeder.
+    """
+    if not DATA_COMPUTED.exists():
+        raise HTTPException(
+            status_code=400,
+            detail='computed.json yok — dışa aktarılacak veri yok. Önce veri yükleyin/rebuild yapın.',
+        )
+
+    # users.json parola hash'lerini, roles.json tüm rol tanımlarını taşır: import ile aynı kural, yalnız tam admin.
+    if include_users and not _tam_admin_mi(admin_user):
+        raise HTTPException(status_code=403, detail='Kullanıcıları ve rolleri dışa aktarmak için tam admin yetkisi gerekir')
+    manifest = _build_export_manifest()
+    manifest['includes_users'] = bool(include_users and DATA_USERS.exists())
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+        for name, path in EXPORT_DATA_FILES:
+            if path.exists():
+                zf.write(path, arcname=name)
+        if include_users and DATA_USERS.exists():
+            zf.write(DATA_USERS, arcname='users.json')
+            if DATA_ROLES.exists():
+                zf.write(DATA_ROLES, arcname='roles.json')
+    buf.seek(0)
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M')
+    filename = f'kt-rakip-analizi-veri_{ts}.zip'
+    return Response(
+        content=buf.getvalue(),
+        media_type='application/zip',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post('/admin/import-data')
+def admin_import_data(
+    file: UploadFile = File(...),
+    include_users: bool = Form(False),
+    user: str = Depends(heavy_op_guard),
+):
+    """
+    /admin/export-data'nın ürettiği ZIP'i içe aktarır. Mevcut veri ÖNCE
+    yedeklenir (_backup_computed + varsa users.json yedeği), sonra atomik
+    olarak değiştirilir. include_users=False (varsayılan): users.json'a
+    dokunulmaz — hedef sunucuda zaten gerçek üye hesapları varsa yanlışlıkla
+    silinmesin diye.
+    """
+    if not file.filename or not file.filename.lower().endswith('.zip'):
+        raise HTTPException(status_code=400, detail='Sadece .zip dosyası kabul edilir')
+
+    try:
+        content = _sinirli_oku(file.file, MAX_IMPORT_TOTAL_BYTES, 'İçe aktarma paketi')
+    finally:
+        file.file.close()
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail='Geçersiz veya bozuk ZIP dosyası')
+    zip_sorun = security.zip_guvenli(zf, MAX_IMPORT_ENTRY_BYTES, MAX_IMPORT_TOTAL_BYTES, en_cok_oran=500)
+    if zip_sorun:
+        raise HTTPException(status_code=400, detail=zip_sorun)
+
+    names = set(zf.namelist())
+    if 'manifest.json' not in names:
+        raise HTTPException(
+            status_code=400,
+            detail='manifest.json bulunamadı — bu dosya /admin/export-data ile mi üretildi?',
+        )
+    if 'computed.json' not in names:
+        raise HTTPException(status_code=400, detail='ZIP içinde computed.json yok')
+
+    try:
+        manifest = json.loads(zf.read('manifest.json'))
+    except ValueError:   # JSONDecodeError + UnicodeDecodeError (UTF-8 olmayan bayt)
+        raise HTTPException(status_code=400, detail='manifest.json bozuk (geçersiz JSON)')
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=400, detail='manifest.json bozuk (nesne değil)')
+
+    # computed.json geçerli JSON mu ve bank_data içeriyor mu — yazmadan önce doğrula
+    try:
+        computed_check = json.loads(zf.read('computed.json'))
+    except ValueError:
+        raise HTTPException(status_code=400, detail='computed.json bozuk (geçersiz JSON)')
+    if not isinstance(computed_check, dict) or not isinstance(computed_check.get('bank_data'), dict):
+        raise HTTPException(status_code=400, detail='computed.json beklenen biçimde değil (bank_data nesnesi yok)')
+    if not computed_check.get('bank_data'):
+        raise HTTPException(status_code=400, detail='computed.json boş görünüyor (bank_data yok) — içe aktarma iptal edildi')
+
+    # users.json/roles.json içeriği doğrulanmadan yazıldığı için (alt-küme ve
+    # yönetim denetimleri bu yolda çalışmaz) yalnız tam admin içe aktarabilir;
+    # aksi halde "Kullanıcılar ve roller" izni olan biri kendine Admin rolü verebilir.
+    if include_users and not _tam_admin_mi(user):
+        raise HTTPException(status_code=403, detail='Kullanıcıları ve rolleri içe aktarmak için tam admin yetkisi gerekir')
+
+    # users.json/roles.json bozuk yazılırsa hiç kimse giriş yapamaz: yazmadan önce yapıyı doğrula
+    if include_users:
+        for ad, anahtar in (('users.json', 'users'), ('roles.json', 'roles')):
+            if ad in names:
+                try:
+                    icerik = json.loads(zf.read(ad))
+                except ValueError:
+                    raise HTTPException(status_code=400, detail=f'{ad} bozuk (geçersiz JSON) — içe aktarma iptal edildi')
+                if not isinstance(icerik, dict) or not isinstance(icerik.get(anahtar), list):
+                    raise HTTPException(status_code=400, detail=f'{ad} beklenen biçimde değil — içe aktarma iptal edildi')
+
+    # Mevcut veriyi yedekle (üzerine yazmadan önce)
+    _backup_computed()
+    if include_users and DATA_USERS.exists() and 'users.json' in names:
+        DATA_BACKUPS.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        shutil.copy2(DATA_USERS, DATA_BACKUPS / f'users_{ts}.json')
+
+    applied = []
+    for name, path in EXPORT_DATA_FILES:
+        if name in names:
+            tmp = path.with_name(path.name + '.import_tmp')
+            with open(tmp, 'wb') as f:
+                f.write(zf.read(name))
+            tmp.replace(path)
+            applied.append(name)
+
+    if include_users and 'users.json' in names:
+        tmp = DATA_USERS.with_name(DATA_USERS.name + '.import_tmp')
+        with open(tmp, 'wb') as f:
+            f.write(zf.read('users.json'))
+        tmp.replace(DATA_USERS)
+        applied.append('users.json')
+        if 'roles.json' in names:
+            tmp = DATA_ROLES.with_name(DATA_ROLES.name + '.import_tmp')
+            with open(tmp, 'wb') as f:
+                f.write(zf.read('roles.json'))
+            tmp.replace(DATA_ROLES)
+            applied.append('roles.json')
+
+    _append_history({
+        'timestamp': datetime.now().isoformat(),
+        'user': user,
+        'filename': f'[IMPORT] {file.filename}',
+        'banka': '*ALL*',
+        'tarih': '*ALL*',
+        'file_size': len(content),
+        'status': 'ok',
+        'rebuild': True,
+    })
+
+    return {
+        'status': 'ok',
+        'applied_files': applied,
+        'source_manifest': manifest,
+    }
+
+
+# ============================================================
+# Hata sayfaları
+# ============================================================
+@app.exception_handler(404)
+async def not_found(request: Request, exc):
+    return JSONResponse(
+        {'error': 'Sayfa bulunamadı', 'path': str(request.url.path)},
+        status_code=404,
+    )
+
+
+# ============================================================
+# Local dev
+# ============================================================
+if __name__ == '__main__':
+    import uvicorn
+    port = int(os.environ.get('PORT', 8000))
+    # NOT (2026-08-11 güvenlik düzeltmesi, 2026-08-12 HOST env ile genişletildi):
+    # varsayılan host='127.0.0.1' — sunucu SADECE bu makineden erişilebilir.
+    # 0.0.0.0'a geçmek, HTTPS/reverse-proxy olmadan tüm ağa (ofis/ev WiFi veya
+    # internet) auth'suz /api/data ve admin paneli açar. Docker kurulumunda
+    # HOST=0.0.0.0 ZORUNLU — ama container dışarıya port açmadığı, sadece
+    # önündeki reverse proxy içeriden erişebildiği için dışa açıklık değişmez,
+    # tek public yüzey reverse proxy kalır. Docker dışı bir
+    # ortamda (yerel geliştirme, bu makine) HOST'u ASLA elle 0.0.0.0 yapma.
+    host = os.environ.get('HOST', '127.0.0.1')
+    # KRİTİK (denetim #12): TEK WORKER şart — `workers` verilmiyor (varsayılan 1).
+    # users.json kilidi (users.py::_users_file_lock), ağır-işlem kilidi
+    # (_heavy_op_lock) ve login rate-limit (_login_attempts) hepsi IN-PROCESS
+    # (threading) yapılardır. gunicorn/uvicorn --workers>1 ya da birden çok
+    # konteyner replikası ile bu koruma katmanları BOZULUR: iki worker aynı
+    # users.json'a yazıp veri kaybettirir, rebuild kilidi paralel rebuild'i
+    # durduramaz. Çoklu-worker gerekirse önce bunlar process-arası (fcntl.flock
+    # + paylaşımlı sayaç, ör. Redis) yapılmalı. Deploy'da da tek replika tut.
+    uvicorn.run('app:app', host=host, port=port, reload=False, workers=1)
