@@ -1293,7 +1293,8 @@
     border-bottom: 1px solid rgba(0,0,0,0.02);
   }
   body.dark .bank-row { border-bottom-color: rgba(255,255,255,0.04); }
-  .bank-row.kt { background: rgba(var(--odak-rgb),0.1); min-height: 46px; }   /* Kuveyt Türk satırı diğerlerinden yüksek (2026-11-05) */
+  .bank-row.kt { background: rgba(var(--odak-rgb),0.1); }
+  @media (min-width: 901px) { .bank-row.kt { min-height: 46px; } }   /* Kuveyt Türk satırı yalnız masaüstünde diğerlerinden yüksek (2026-11-05); mobilde normal */
   body.dark .bank-row.kt { background: rgba(var(--odak-rgb),0.18); }
 
   .bank-row-name {
@@ -1416,6 +1417,8 @@
     display: inline-block; width: 28px; min-width: 28px; margin-right: 4px; text-align: right; font-weight: 600;
     color: #94a3b8; font-variant-numeric: tabular-nums;
   }
+  /* Kuveyt Türk satırı büyütmeleri (ad/değer/sıra punto) yalnız masaüstü genişliğinde (≥901 px); mobilde ve dar ekranda normal boyut (2026-11-06) */
+  @media (min-width: 901px) {
   /* Kuveyt Türk satırının sıra rakamı: yuvarlak içine alınmaz, yalnız büyük ve kalın odak renginde (2026-11-05) */
   body:not(.pdf-capture):not(.pdf-slide) .bank-row.kt .bank-row-sira {
     /* Gerçek punto (transform yok): kutu 28 px ve satır yüksek olduğundan iki haneli rakam da tam sığar, ad hizası bozulmaz */
@@ -1427,6 +1430,7 @@
   body:not(.pdf-capture):not(.pdf-slide) .bank-row.kt .bank-row-name, body:not(.pdf-capture):not(.pdf-slide) .snap-fit.fit-on .ranking-panel .bank-row.kt .bank-row-name { font-size: 16px !important; line-height: 1.1 !important; font-weight: 800 !important; }
   body:not(.pdf-capture):not(.pdf-slide) .bank-row.kt .bank-value, body:not(.pdf-capture):not(.pdf-slide) .snap-fit.fit-on .ranking-panel .bank-row.kt .bank-value { font-size: 16px !important; font-weight: 800 !important; }
   body:not(.pdf-capture):not(.pdf-slide) .bank-row.kt .bank-delta-cell, body:not(.pdf-capture):not(.pdf-slide) .snap-fit.fit-on .bank-row.kt .bank-delta-cell { font-size: 14px !important; font-weight: 800 !important; }
+  }
   @media (max-width: 900px) { .bank-row-sira { display: none; } }
   body:not(.pdf-capture):not(.pdf-slide) .rank-badge-row { display: none; }
   body.pdf-capture .bank-row-sira {
